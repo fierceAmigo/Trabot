@@ -7,7 +7,7 @@ Lean version of scan_options_v22.py:
 - Delta-target strike selection
 - Option ATR SL/Target + time stop
 - Output: Top2 Buy/Sell + Top10 minimal
-- Writes: data/options_scan_global_v22_results.csv + snapshots + reco_latest_global_v22.csv
+- Writes: data/options_scan_global_v22_results{suffix}.csv + snapshots + reco_latest_global_v22{suffix}.csv
 - Appends to shared data/reco_history.csv
 
 Educational tool only – not financial advice.
@@ -16,6 +16,7 @@ Educational tool only – not financial advice.
 from __future__ import annotations
 
 import os
+import argparse
 import time
 import math
 import datetime as dt
@@ -79,6 +80,44 @@ TRABOT_RISK_PROFILE = os.getenv("TRABOT_RISK_PROFILE", "high").strip().lower()
 
 IV_PCTL_WINDOW_DAYS = int(os.getenv("IV_PCTL_WINDOW", "30"))
 IV_EWMA_SPAN = int(os.getenv("IV_EWMA_SPAN", "10"))
+
+# --- Expert quality gates / sizing (v2.2.1) ---
+MIN_MID_PRICE = float(os.getenv("TRABOT_MIN_MID_PRICE", "8"))          # ignore tiny premiums (tick noise)
+MAX_SPREAD_PCT = float(os.getenv("TRABOT_MAX_SPREAD_PCT", "0.08"))     # max (ask-bid)/mid
+MIN_OI = int(os.getenv("TRABOT_MIN_OI", "20000"))                      # per strike
+MIN_VOL = int(os.getenv("TRABOT_MIN_VOL", "5000"))                     # per strike
+RISK_PER_TRADE_PCT = float(os.getenv("TRABOT_RISK_PER_TRADE_PCT", "0.015"))  # stop-risk based sizing
+
+# Expiry band (DTE) control (v2.2.x)
+MIN_DTE_DAYS = int(os.getenv("TRABOT_MIN_DTE_DAYS", "0"))
+_MAX_DTE_ENV = os.getenv("TRABOT_MAX_DTE_DAYS", "").strip()
+MAX_DTE_DAYS = int(_MAX_DTE_ENV) if _MAX_DTE_ENV else None
+
+# Dual-mode defaults (intraday + swing)
+MODE_DEFAULTS = {
+    # Spot interval uses market_data interval keys (e.g., 15m, 60m).
+    "intraday": {
+        "interval": "15m",
+        "time_stop_min": 90,
+        "min_dte": 0,
+        "max_dte": 7,
+        "opt_atr_interval": "5minute",
+        "sl_mult_opt": 1.2,
+        "tgt_mult_opt": 1.8,
+        "risk_pct": 0.010,
+    },
+    "swing": {
+        "interval": "60m",
+        "time_stop_min": 2880,  # 2 days
+        "min_dte": 4,
+        "max_dte": 14,
+        "opt_atr_interval": "15minute",
+        "sl_mult_opt": 1.5,
+        "tgt_mult_opt": 2.2,
+        "risk_pct": 0.015,
+    },
+}
+
 
 INDEX_SPOT_MAP = {
     "NIFTY": "NSE:NIFTY 50",
@@ -223,6 +262,7 @@ def _score_strike_rows(df_side: pd.DataFrame, atm: int) -> pd.DataFrame:
     x["mid"] = (x["bid_num"] + x["ask_num"]) / 2.0
     x["spread_pct"] = (x["ask_num"] - x["bid_num"]) / x["mid"]
     x["spread_pct"] = x["spread_pct"].replace([math.inf, -math.inf], math.nan)
+    x["spread_pct"] = x["spread_pct"].clip(lower=0.0, upper=0.80)
     x["liq"] = (x["oi_num"].add(1).apply(math.log)) * 0.7 + (x["vol_num"].add(1).apply(math.log)) * 0.3
     liq_max = float(x["liq"].max()) if len(x) else 1.0
     liq_max = liq_max if liq_max > 0 else 1.0
@@ -235,12 +275,80 @@ def _score_strike_rows(df_side: pd.DataFrame, atm: int) -> pd.DataFrame:
     return x
 
 
+
+def _safe_mid(bid: float | None, ask: float | None, ltp: float | None) -> float | None:
+    if bid is not None and ask is not None and bid > 0 and ask > 0:
+        return (bid + ask) / 2.0
+    if ltp is not None and ltp > 0:
+        return float(ltp)
+    return None
+
+
+def _atm_iv_from_chain(chain) -> tuple[float | None, str]:
+    """
+    Estimate an ATM IV for the *underlying* using ATM CE/PE mid prices.
+    Returns (atm_iv, confidence).
+    """
+    try:
+        atm = int(chain.atm)
+        ivs: list[float] = []
+        confs: list[str] = []
+        for df_side, right in [(chain.calls, "CE"), (chain.puts, "PE")]:
+            if df_side is None or df_side.empty:
+                continue
+            row = df_side[df_side["strike"].astype(int) == atm].head(1)
+            if row.empty:
+                continue
+            r = row.iloc[0].to_dict()
+            bid = float(pd.to_numeric(r.get("bid"), errors="coerce") or 0) or None
+            ask = float(pd.to_numeric(r.get("ask"), errors="coerce") or 0) or None
+            ltp = float(pd.to_numeric(r.get("last_price"), errors="coerce") or 0) or None
+            px = _safe_mid(bid, ask, ltp)
+            if px is None or px <= 0:
+                continue
+            iv, _, conf, _ = _compute_iv_and_greeks(float(chain.spot), chain.expiry, right, atm, float(px))
+            if iv and iv > 0:
+                ivs.append(float(iv))
+                confs.append(conf)
+
+        if not ivs:
+            return None, "low"
+        atm_iv = float(sum(ivs) / len(ivs))
+        confidence = "high" if all(c == "high" for c in confs) else "mid"
+        return atm_iv, confidence
+    except Exception:
+        return None, "low"
+
+
+def _risk_lots_from_stop(capital: float, entry: float, sl: float, lot_size: int) -> int:
+    """
+    Stop-risk based sizing (₹). Returns lots.
+    """
+    if capital <= 0 or entry <= 0 or sl <= 0 or lot_size <= 0:
+        return 0
+    loss_per_unit = max(0.0, entry - sl)
+    if loss_per_unit <= 1e-9:
+        return 0
+    risk_rupees = float(capital) * float(RISK_PER_TRADE_PCT)
+    lots = int(risk_rupees // (loss_per_unit * lot_size))
+    return max(0, lots)
+
+
 def pick_contract_delta_target(chain, want_right: str, delta_target: float = 0.50) -> dict | None:
     df_side = chain.calls if want_right == "CE" else chain.puts
     if df_side is None or df_side.empty:
         return None
     scored = _score_strike_rows(df_side, atm=int(chain.atm))
     scored = scored.dropna(subset=["bid_num", "ask_num"], how="any")
+
+    # Expert liquidity gates
+    scored = scored[
+        (scored["mid"] >= MIN_MID_PRICE) &
+        (scored["spread_pct"].fillna(1.0) <= MAX_SPREAD_PCT) &
+        (scored["oi_num"] >= MIN_OI) &
+        (scored["vol_num"] >= MIN_VOL)
+    ].copy()
+
     if scored.empty:
         return None
     top = scored.sort_values("strike_score", ascending=False).head(6).copy()
@@ -331,20 +439,20 @@ def option_atr(df: pd.DataFrame, period: int) -> float:
     return float(atr) if pd.notna(atr) else 0.0
 
 
-def refine_levels(c: dict) -> dict:
+def refine_levels(c: dict, opt_interval: str, opt_period: int, opt_bars: int, sl_mult: float, tgt_mult: float) -> dict:
     tsym = str(c.get("tradingsymbol"))
     entry = float(c.get("entry") or 0.0)
     if not tsym or entry <= 0:
         return c
     try:
-        df_opt = fetch_option_candles_recent(tsym, OPT_ATR_INTERVAL, OPT_ATR_BARS)
-        atr = option_atr(df_opt, OPT_ATR_PERIOD)
+        df_opt = fetch_option_candles_recent(tsym, opt_interval, opt_bars)
+        atr = option_atr(df_opt, opt_period)
         if atr <= 0:
             return c
         c = c.copy()
         c["opt_atr"] = float(atr)
-        c["sl"] = max(0.05, entry - SL_ATR_MULT_OPT * atr)
-        c["target"] = entry + TGT_ATR_MULT_OPT * atr
+        c["sl"] = max(0.05, entry - sl_mult * atr)
+        c["target"] = entry + tgt_mult * atr
         return c
     except Exception:
         return c
@@ -388,29 +496,55 @@ def reco_row(c: dict, ts_str: str, run_id: str, bucket: str) -> dict:
         "vega_1pct": c.get("vega_1pct"),
         "theta_day": c.get("theta_day"),
         "lot_size": c.get("lot_size"),
-        "max_lots": c.get("max_lots"),
+        "greeks_max_lots": c.get("max_lots"),
+        "risk_lots": c.get("risk_lots"),
+        "max_lots": c.get("final_lots", c.get("max_lots")),
         "pass_caps": c.get("pass_caps"),
         "reason": c.get("reason"),
+        "notes": c.get("notes"),
+        "strike_score": c.get("strike_score"),
+        "spread_pct": c.get("spread_pct"),
     }
 
 
-def main():
+def main(mode: str = "intraday"):
     run_ts = dt.datetime.now()
     ts_str = run_ts.isoformat(timespec="seconds")
     run_id = make_run_id(run_ts)
+
+    # Mode-aware parameters (intraday vs swing)
+    mode = (mode or os.getenv("TRABOT_MODE", "intraday")).strip().lower()
+    if mode not in MODE_DEFAULTS:
+        mode = "intraday"
+    md = MODE_DEFAULTS[mode]
+
+    interval = os.getenv("INTERVAL", md["interval"]) or md["interval"]
+    time_stop_min = int(os.getenv("TRABOT_TIME_STOP_MIN", str(md["time_stop_min"])) or md["time_stop_min"])
+
+    min_dte_days = int(os.getenv("TRABOT_MIN_DTE_DAYS", str(md["min_dte"])) or md["min_dte"])
+    max_dte_days_env = os.getenv("TRABOT_MAX_DTE_DAYS", str(md["max_dte"] if md["max_dte"] is not None else "")).strip()
+    max_dte_days = int(max_dte_days_env) if max_dte_days_env else None
+
+    opt_atr_interval = os.getenv("TRABOT_OPT_ATR_INTERVAL", md["opt_atr_interval"]) or md["opt_atr_interval"]
+    sl_mult_opt = float(os.getenv("TRABOT_SL_ATR_MULT_OPT", str(md["sl_mult_opt"])) or md["sl_mult_opt"])
+    tgt_mult_opt = float(os.getenv("TRABOT_TGT_ATR_MULT_OPT", str(md["tgt_mult_opt"])) or md["tgt_mult_opt"])
+
+    risk_pct = float(os.getenv("TRABOT_RISK_PER_TRADE_PCT", str(md["risk_pct"])) or md["risk_pct"])
+
+    suffix = f"_{mode}"
 
     universe = build_universe_all_options()
     lot_map = build_lot_size_map()
 
     print(f"\n=== GLOBAL OPTIONS SCAN V2.2 ===")
-    print(f"Universe: {len(universe)} underlyings | interval={INTERVAL}")
+    print(f"Universe: {len(universe)} underlyings | interval={interval}")
     print(f"Capital: ₹{TRABOT_CAPITAL:,.0f} | risk={TRABOT_RISK_PROFILE} | TTL={CACHE_TTL_MINUTES} min")
     print(f"Run: {ts_str} (run_id={run_id})\n")
 
     cands = []
     for item in universe:
         try:
-            df, _ = fetch_history_cached(item["spot"], lookback_days=LOOKBACK_DAYS, interval=INTERVAL)
+            df, _ = fetch_history_cached(item["spot"], lookback_days=LOOKBACK_DAYS, interval=interval)
             if df is None or df.empty:
                 continue
 
@@ -470,21 +604,25 @@ def main():
                 strike_step=0,
                 strikes_around_atm=STRIKES_AROUND_ATM,
                 cache_path=INSTRUMENTS_CACHE_PATH,
+                min_dte_days=min_dte_days,
+                max_dte_days=max_dte_days,
             )
 
-            # IV percentile
-            append_iv_snapshot({
-                "ts": dt.datetime.now().isoformat(timespec="seconds"),
-                "underlying": item["underlying"],
-                "tradingsymbol": "",
-                "expiry": chain.expiry,
-                "strike": int(chain.atm),
-                "right": "",
-                "spot": float(chain.spot),
-                "price": 0.0,
-                "iv": 0.0,
-                "confidence": "high",
-            })
+            # IV percentile (ATM IV snapshot; skips invalid rows)
+            atm_iv, atm_conf = _atm_iv_from_chain(chain)
+            if atm_iv is not None:
+                append_iv_snapshot({
+                    "ts": dt.datetime.now().isoformat(timespec="seconds"),
+                    "underlying": item["underlying"],
+                    "tradingsymbol": "",
+                    "expiry": chain.expiry,
+                    "strike": int(chain.atm),
+                    "right": "ATM",
+                    "spot": float(chain.spot),
+                    "price": 0.0,
+                    "iv": float(atm_iv),
+                    "confidence": atm_conf,
+                })
             pct, n, _ = iv_percentile(item["underlying"], window_days=IV_PCTL_WINDOW_DAYS, ewma_span=IV_EWMA_SPAN)
 
             regime = "VOLATILE" if (pct is not None and pct >= HIGH_IV_PCTL) else ("TREND" if float(sig.metrics.get("adx", 0)) >= ADX_GATE else "CHOP")
@@ -546,6 +684,29 @@ def main():
                 base *= 0.85
             score = base if side == "LONG" else -base
 
+            # Explainability notes (expert-style)
+            notes = []
+            notes.append(f"conf={conf_score}/3")
+            notes.append(f"adx={float(sig.metrics.get('adx',0.0) or 0.0):.1f}")
+            if pct is not None:
+                notes.append(f"ivp={float(pct):.2f}")
+            notes.append(f"dte={dte}")
+            try:
+                notes.append(f"spr={float(pick.get('spread_pct', 0.0)):.3f}")
+            except Exception:
+                pass
+            try:
+                notes.append(f"liq={float(pick.get('strike_score', 0.0)):.2f}")
+            except Exception:
+                pass
+            if high_iv_block:
+                notes.append("HIGH_IV_BLOCK")
+            if greeks_conf == "low":
+                notes.append("GREEKS_LOW")
+            if move_atr_ratio < MOVE_ATR_GATE:
+                notes.append("MOVE_WEAK")
+            notes_str = " | ".join(notes)
+
             cands.append({
                 "underlying": item["underlying"],
                 "spot_symbol": item["spot"],
@@ -562,6 +723,10 @@ def main():
                 "move_atr_ratio": float(move_atr_ratio),
                 "high_iv_block": bool(high_iv_block),
 
+                "strike_score": float(pick.get("strike_score", 0.0)) if pick.get("strike_score") == pick.get("strike_score") else float("nan"),
+                "spread_pct": float(pick.get("spread_pct", 0.0)) if pick.get("spread_pct") == pick.get("spread_pct") else float("nan"),
+                "notes": notes_str,
+
                 "tradingsymbol": tsym,
                 "kite_symbol": f"NFO:{tsym}",
                 "strike": int(strike),
@@ -569,7 +734,7 @@ def main():
                 "entry": float(entry_opt),
                 "sl": float("nan"),
                 "target": float("nan"),
-                "time_stop_min": int(TIME_STOP_MIN),
+                "time_stop_min": int(time_stop_min),
 
                 "iv": float(iv),
                 "iv_pct": float(pct) if pct is not None else float("nan"),
@@ -599,7 +764,7 @@ def main():
     ranked = sorted(cands, key=lambda x: abs(float(x["score"])), reverse=True)
 
     # refine topK with option ATR
-    refined = [refine_levels(c) for c in ranked[:max(REFINE_TOPK, TOP10, TOP2 * 2)]]
+    refined = [refine_levels(c, opt_atr_interval, OPT_ATR_PERIOD, OPT_ATR_BARS, sl_mult_opt, tgt_mult_opt) for c in ranked[:max(REFINE_TOPK, TOP10, TOP2 * 2)]]
     ref_map = {r["tradingsymbol"]: r for r in refined}
     ranked = [ref_map.get(c["tradingsymbol"], c) for c in ranked]
 
@@ -608,6 +773,23 @@ def main():
             c["sl"] = max(0.05, float(c["entry"]) * 0.70)
         if not (isinstance(c.get("target"), (int, float)) and pd.notna(c.get("target"))):
             c["target"] = float(c["entry"]) * 1.35
+
+    # Final sizing: stop-risk lots + greeks lots
+    for c in ranked:
+        try:
+            rl = _risk_lots_from_stop(TRABOT_CAPITAL, float(c["entry"]), float(c["sl"]), int(c.get("lot_size", 1)))
+        except Exception:
+            rl = 0
+        c["risk_lots"] = int(rl)
+        if rl > 0:
+            c["final_lots"] = int(min(int(c.get("max_lots", 0)), rl))
+        else:
+            c["final_lots"] = int(c.get("max_lots", 0))
+        c["pass_caps"] = bool(int(c.get("final_lots", 0)) >= 1)
+
+        # If previously trade_ok, re-check lots
+        if c.get("trade_ok"):
+            c["trade_ok"] = bool(int(c.get("final_lots", 0)) >= 1)
 
     trade = [c for c in ranked if c.get("trade_ok")]
     watch = [c for c in ranked if not c.get("trade_ok")]
@@ -631,8 +813,8 @@ def main():
     _ensure_dir(DATA_DIR)
 
     df_all = pd.DataFrame(ranked)
-    df_all.to_csv(os.path.join(DATA_DIR, "options_scan_global_v22_results.csv"), index=False)
-    df_all.to_csv(os.path.join(DATA_DIR, f"options_scan_global_v22_results_{run_id}.csv"), index=False)
+    df_all.to_csv(os.path.join(DATA_DIR, f"options_scan_global_v22_results{suffix}.csv"), index=False)
+    df_all.to_csv(os.path.join(DATA_DIR, f"options_scan_global_v22_results{suffix}_{run_id}.csv"), index=False)
 
     df_top10 = pd.DataFrame([{
         "ts_reco": ts_str,
@@ -643,8 +825,8 @@ def main():
         "target": c["target"],
         "time_stop_min": c.get("time_stop_min", TIME_STOP_MIN),
     } for c in top10])
-    df_top10.to_csv(os.path.join(DATA_DIR, "options_global_top10_v22.csv"), index=False)
-    df_top10.to_csv(os.path.join(DATA_DIR, f"options_global_top10_v22_{run_id}.csv"), index=False)
+    df_top10.to_csv(os.path.join(DATA_DIR, f"options_global_top10_v22{suffix}.csv"), index=False)
+    df_top10.to_csv(os.path.join(DATA_DIR, f"options_global_top10_v22{suffix}_{run_id}.csv"), index=False)
 
     reco_rows = []
     for c in buy:
@@ -655,15 +837,18 @@ def main():
         reco_rows.append(reco_row(c, ts_str, run_id, f"TOP{TOP10}_OVERALL"))
 
     append_history(reco_rows, path=os.getenv("TRABOT_RECO_HISTORY", os.path.join(DATA_DIR, "reco_history.csv")))
-    save_snapshot(reco_rows, os.path.join(DATA_DIR, "reco_latest_global_v22.csv"))
-    save_snapshot(reco_rows, os.path.join(DATA_DIR, f"reco_global_v22_{run_id}.csv"))
+    save_snapshot(reco_rows, os.path.join(DATA_DIR, f"reco_latest_global_v22{suffix}.csv"))
+    save_snapshot(reco_rows, os.path.join(DATA_DIR, f"reco_global_v22{suffix}_{run_id}.csv"))
 
-    print(f"\nSaved: {os.path.join(DATA_DIR, 'options_scan_global_v22_results.csv')}")
-    print(f"Saved: {os.path.join(DATA_DIR, 'options_global_top10_v22.csv')}")
-    print(f"Saved: {os.path.join(DATA_DIR, 'reco_latest_global_v22.csv')}")
+    print(f"\nSaved: {os.path.join(DATA_DIR, 'options_scan_global_v22_results{suffix}.csv')}")
+    print(f"Saved: {os.path.join(DATA_DIR, 'options_global_top10_v22{suffix}.csv')}")
+    print(f"Saved: {os.path.join(DATA_DIR, 'reco_latest_global_v22{suffix}.csv')}")
     print(f"Appended: {os.path.join(DATA_DIR, 'reco_history.csv')}")
     print("\nNOTE: Research/education only. Not financial advice.")
 
 
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", choices=["intraday", "swing"], default=os.getenv("TRABOT_MODE", "intraday"))
+    args = ap.parse_args()
+    main(mode=args.mode)

@@ -1,428 +1,875 @@
-# ===========================
-# scan_options_v22.py
-# SENTIMENT ENABLED VERSION
-# ===========================
+"""
+scan_options_v22.py
 
-"""scan_options.py
-
-Main full-universe options scanner (Kite-only) with V2.1 strategy upgrades
-while keeping your existing core strengths:
-
-Keeps:
-  - Full NFO-OPT universe scan (≈200+ underlyings)
-  - Underlying signal + watch-plan from strategy.compute_signal
-  - HTF (60m) alignment penalty
-  - Session factor
-  - BOS detection
-  - Strike selection via liquidity+spread+moneyness (strike_score)
-  - Learned edge feature from backtest._simulate_forward
-
-Adds (V2.1):
-  - Daily IV snapshot -> EWMA smoothed rolling 30D percentile (iv_store)
-  - BS Greeks for the picked contract (iv_greeks)
-  - Expiry-week penalty (DTE<=3)
-  - Replace approx-delta with BS delta in stop/target mapping
-  - Regime label (TREND/CHOP/VOLATILE) driven primarily by IV percentile
-  - Dynamic position sizing (max lots) via risk_caps.compute_max_lots
-
-NEW (Sentiment overlay):
-  - INDIA VIX percentile (fear gauge)
-  - NIFTY 1H trend bias
-  - NIFTY option-chain PCR + IV skew + OI walls
-  - Score multiplier based on market bias/risk-off state
-  - Append market sentiment history (data/market_sentiment_history.csv)
+Full-universe options scanner (Kite-only) with V2.2 strategy upgrades:
+- IV percentile (rolling window with EWMA smoothing) using iv_store
+- BS Greeks for picked contract (iv_greeks)
+- Regime label (TREND/CHOP/VOLATILE) driven primarily by IV percentile
+- Dynamic position sizing (greeks caps + stop-risk lots)
+- Expert liquidity gates (spread/OI/volume/min premium)
+- Market sentiment overlay (INDIA VIX + NIFTY option-chain aggregates) via market_sentiment
 
 Outputs:
-  data/options_scan_results.csv
-  data/options_top{TOP_OVERALL}.csv
+  data/options_scan_results_v22_v22.csv (+ timestamped)
+  data/options_top10_v22_v22.csv (+ timestamped)
+  data/reco_latest_v22.csv (+ timestamped)
+  append-only: data/reco_history.csv
 
-NOTE: Educational tool only. Not financial advice.
+Educational tool only – not financial advice.
 """
 
+
+from __future__ import annotations
+
 import os
+import argparse
 import math
 import time
 from datetime import datetime
-from pathlib import Path
+from typing import Optional, Tuple
 
 import pandas as pd
 
-from config import (
-    LOOKBACK_DAYS, INTERVAL,
-    EMA_FAST, EMA_SLOW, RSI_PERIOD, ADX_PERIOD, ADX_MIN,
-    ATR_PERIOD, STOP_ATR_MULT, TARGET_ATR_MULT,
-    INSTRUMENTS_CACHE_PATH,
-)
-
 from kite_client import get_kite
-from market_data import fetch_history
-from strategy import compute_signal
 from kite_chain import get_kite_chain_slice
+from strategy import compute_signal
 
-from iv_greeks import implied_volatility, greeks, time_to_expiry_years
 from iv_store import append_iv_snapshot, iv_percentile
+from iv_greeks import time_to_expiry_years, implied_volatility, greeks
 from risk_caps import compute_max_lots
 
+from journal import append_history, save_snapshot, make_run_id
 
-# =========================
-# Runtime knobs (env vars)
-# =========================
-TOP_N = int(os.environ.get("TRABOT_TOP_N", "5"))
-TOP_OVERALL = int(os.environ.get("TRABOT_TOP_OVERALL", "20"))
-STRIKES_AROUND_ATM = int(os.environ.get("TRABOT_STRIKES_AROUND_ATM", "6"))
+from market_sentiment import compute_market_context, append_market_context, MarketContext
 
-UNIVERSE_START = int(os.environ.get("TRABOT_UNIVERSE_START", "0"))
-UNIVERSE_COUNT = os.environ.get("TRABOT_UNIVERSE_COUNT", "")
+
+
+# ----------------------------
+# Config
+# ----------------------------
+
+DATA_DIR = os.getenv("TRABOT_DATA_DIR", "data")
+
+INSTRUMENTS_CACHE_PATH = os.getenv("INSTRUMENTS_CACHE_PATH", os.path.join(DATA_DIR, "kite_instruments_NFO.csv"))
+CACHE_TTL_MINUTES = int(os.getenv("TRABOT_CACHE_TTL_MIN", "5"))  # you wanted max 5 mins
+
+LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "180"))
+INTERVAL = os.getenv("INTERVAL", "day")  # "day" or "60m" etc.
+
+UNIVERSE_START = int(os.getenv("UNIVERSE_START", "0"))
+UNIVERSE_COUNT = os.getenv("UNIVERSE_COUNT", "")
 UNIVERSE_COUNT = int(UNIVERSE_COUNT) if UNIVERSE_COUNT.strip() else None
 
-# ✅ Default TTL lowered to 5 minutes (realtime-friendly)
-CACHE_TTL_MINUTES = int(os.environ.get("TRABOT_CACHE_TTL_MIN", "5"))
-CANDLE_CACHE_DIR = Path("data/candle_cache")
+STRIKES_AROUND_ATM = int(os.getenv("STRIKES_AROUND_ATM", "12"))
 
-SLEEP_BETWEEN_SYMBOLS = float(os.environ.get("TRABOT_SLEEP", "0.05"))
+# NEW: smaller actionable outputs
+TOP2 = int(os.getenv("TRABOT_TOP2", "2"))            # top 2 buy + top 2 sell
+TOP10 = int(os.getenv("TRABOT_TOP10", "10"))         # top 10 overall (entry/sl/target only)
+TOP_OVERALL_ABS = int(os.getenv("TRABOT_TOP_ABS", "20"))  # still saved in full results if you want
 
-TRABOT_CAPITAL = float(os.environ.get("TRABOT_CAPITAL", "20000"))
-TRABOT_RISK_PROFILE = os.environ.get("TRABOT_RISK_PROFILE", "high").strip().lower()
+LOOKUP_SYMBOL = os.getenv("LOOKUP_SYMBOL", "").strip().upper()
+SLEEP_BETWEEN_SYMBOLS = float(os.getenv("SLEEP_BETWEEN_SYMBOLS", "0.0"))
 
-# Optional: lookup one tradingsymbol and show its rank
-LOOKUP_SYMBOL = os.environ.get("TRABOT_LOOKUP", "").strip().upper()
+EMA_FAST = int(os.getenv("EMA_FAST", "20"))
+EMA_SLOW = int(os.getenv("EMA_SLOW", "50"))
+RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
+ADX_PERIOD = int(os.getenv("ADX_PERIOD", "14"))
+ADX_MIN = float(os.getenv("ADX_MIN", "18"))
+ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
+STOP_ATR_MULT = float(os.getenv("STOP_ATR_MULT", "1.5"))
+TARGET_ATR_MULT = float(os.getenv("TARGET_ATR_MULT", "2.0"))
+
+RISK_FREE = float(os.getenv("RISK_FREE_RATE", "0.06"))
+TRABOT_CAPITAL = float(os.getenv("TRABOT_CAPITAL", "20000"))
+TRABOT_RISK_PROFILE = os.getenv("TRABOT_RISK_PROFILE", "high").strip().lower()
+
+IV_PCTL_WINDOW_DAYS = int(os.getenv("IV_PCTL_WINDOW", "30"))
+IV_EWMA_SPAN = int(os.getenv("IV_EWMA_SPAN", "10"))
+
+# --- Expert quality gates / sizing (v2.2) ---
+MIN_MID_PRICE = float(os.getenv("TRABOT_MIN_MID_PRICE", "8"))
+MAX_SPREAD_PCT = float(os.getenv("TRABOT_MAX_SPREAD_PCT", "0.08"))
+MIN_OI = int(os.getenv("TRABOT_MIN_OI", "20000"))
+MIN_VOL = int(os.getenv("TRABOT_MIN_VOL", "5000"))
+RISK_PER_TRADE_PCT = float(os.getenv("TRABOT_RISK_PER_TRADE_PCT", "0.015"))
+TIME_STOP_MIN = int(os.getenv("TRABOT_TIME_STOP_MIN", "90"))
+
+# Expiry band (DTE) control (v2.2.x)
+MIN_DTE_DAYS = int(os.getenv("TRABOT_MIN_DTE_DAYS", "0"))
+_MAX_DTE_ENV = os.getenv("TRABOT_MAX_DTE_DAYS", "").strip()
+MAX_DTE_DAYS = int(_MAX_DTE_ENV) if _MAX_DTE_ENV else None
+
+# HTF interval (used for alignment + sentiment trend calc)
+HTF_INTERVAL = os.getenv("TRABOT_HTF_INTERVAL", "60m")
+
+# Dual-mode defaults (intraday + swing)
+MODE_DEFAULTS = {
+    "intraday": {
+        "interval": "15m",
+        "htf_interval": "60m",
+        "lookback_days": 120,
+        "stop_atr_mult": 1.2,
+        "target_atr_mult": 1.8,
+        "time_stop_min": 90,
+        "min_dte": 0,
+        "max_dte": 7,
+        "risk_pct": 0.010,
+    },
+    "swing": {
+        "interval": "60m",
+        "htf_interval": "day",
+        "lookback_days": 240,
+        "stop_atr_mult": 1.6,
+        "target_atr_mult": 2.4,
+        "time_stop_min": 2880,
+        "min_dte": 4,
+        "max_dte": 14,
+        "risk_pct": 0.015,
+    },
+}
+
+SENTIMENT_ENABLED = os.getenv("TRABOT_SENTIMENT_ENABLED", "1").strip() not in ("0", "false", "False")
+SENTIMENT_INDEX_UNDERLYING = os.getenv("TRABOT_SENTIMENT_INDEX", "NIFTY").strip().upper()
+SENTIMENT_INDEX_SPOT = os.getenv("TRABOT_SENTIMENT_SPOT", "NSE:NIFTY 50")
 
 
-# Index spot symbol mapping (Kite uses special names for indices)
+TREND_STRENGTH_THRESHOLD = float(os.getenv("TREND_STRENGTH_THRESHOLD", "0.01"))
+VOLATILE_IV_PCTL = float(os.getenv("VOLATILE_IV_PCTL", "0.70"))
+EXPIRY_PENALTY_DTE = int(os.getenv("EXPIRY_PENALTY_DTE", "3"))
+
+
 INDEX_SPOT_MAP = {
     "NIFTY": "NSE:NIFTY 50",
     "BANKNIFTY": "NSE:NIFTY BANK",
     "FINNIFTY": "NSE:NIFTY FIN SERVICE",
     "MIDCPNIFTY": "NSE:NIFTY MID SELECT",
-    "NIFTYNXT50": "NSE:NIFTY NEXT 50",
 }
 
-# =========================
-# Market sentiment (Kite-only)
-# =========================
-# We use *proxy* sentiment derived from:
-#   - INDIA VIX (fear / uncertainty)
-#   - Index (NIFTY) trend on 60m candles (directional bias)
-#   - Index option-chain: OI PCR + OTM IV skew + OI "walls"
-#
-# This is intentionally simple and robust: if any component fails, we degrade gracefully.
 
-SENTIMENT_INDEX_UNDERLYING = os.environ.get("TRABOT_SENTIMENT_INDEX", "NIFTY").strip().upper()
-SENTIMENT_SKEW_STEPS = int(os.environ.get("TRABOT_SENTIMENT_SKEW_STEPS", "4"))  # OTM distance in strike-steps
-SENTIMENT_WALL_NEAR_PCT = float(os.environ.get("TRABOT_SENTIMENT_WALL_NEAR_PCT", "0.006"))  # 0.6% from spot
-SENTIMENT_USE = os.environ.get("TRABOT_SENTIMENT", "1").strip() not in ("0", "false", "False", "no", "NO")
+# ----------------------------
+# Universe / instruments
+# ----------------------------
 
-MARKET_SENTIMENT_HISTORY_CSV = os.path.join("data", "market_sentiment_history.csv")
+def _ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
 
 
-def _safe_float(x, default: float | None = None) -> float | None:
-    try:
-        v = float(x)
-        if v != v:
-            return default
-        return v
-    except Exception:
-        return default
+def build_universe_all_options() -> list[dict]:
+    _ensure_dir(DATA_DIR)
+    kite = get_kite()
 
+    if os.path.exists(INSTRUMENTS_CACHE_PATH):
+        inst = pd.read_csv(INSTRUMENTS_CACHE_PATH)
+    else:
+        inst = pd.DataFrame(kite.instruments("NFO"))
+        inst.to_csv(INSTRUMENTS_CACHE_PATH, index=False)
 
-def _pct_rank_last(series: pd.Series, window: int = 30) -> float | None:
-    s = pd.to_numeric(series, errors="coerce").dropna()
-    if len(s) < max(10, window):
-        return None
-    w = s.iloc[-window:]
-    last = float(w.iloc[-1])
-    return float((w <= last).mean())
+    opt = inst[inst["segment"].astype(str).str.upper() == "NFO-OPT"].copy()
+    if opt.empty:
+        return []
 
-
-def _infer_strike_step(strikes: list[int]) -> int:
-    """Infer strike increment from a list of strikes."""
-    try:
-        xs = sorted({int(x) for x in strikes if x is not None})
-        if len(xs) < 6:
-            return 50
-        diffs = [xs[i + 1] - xs[i] for i in range(min(len(xs) - 1, 25)) if xs[i + 1] - xs[i] > 0]
-        if not diffs:
-            return 50
-        diffs = sorted(diffs)
-        mid = diffs[len(diffs) // 2]
-        return int(mid) if mid > 0 else 50
-    except Exception:
-        return 50
-
-
-def _mid_from_row(row: dict) -> float | None:
-    b = _safe_float(row.get("bid_num", row.get("bid")))
-    a = _safe_float(row.get("ask_num", row.get("ask")))
-    ltp = _safe_float(row.get("last_price", row.get("ltp", row.get("close"))))
-    if b is not None and a is not None and a > 0:
-        return (b + a) / 2.0
-    if ltp is not None and ltp > 0:
-        return ltp
-    return None
-
-
-def _compute_chain_metrics(chain) -> dict:
-    """OI/volume PCR + OI walls + simple OTM skew (iv_put - iv_call)."""
-    out = {
-        "pcr_oi": None,
-        "pcr_vol": None,
-        "skew": None,
-        "call_wall_strike": None,
-        "put_wall_strike": None,
-        "call_wall_up_pct": None,
-        "put_wall_dn_pct": None,
-    }
-
-    calls = getattr(chain, "calls", None)
-    puts = getattr(chain, "puts", None)
-    if calls is None or puts is None:
-        return out
-    try:
-        calls = calls.copy()
-        puts = puts.copy()
-    except Exception:
-        return out
-    if calls.empty or puts.empty:
-        return out
-
-    calls["oi_num"] = pd.to_numeric(calls.get("oi"), errors="coerce").fillna(0.0)
-    puts["oi_num"] = pd.to_numeric(puts.get("oi"), errors="coerce").fillna(0.0)
-    calls["vol_num"] = pd.to_numeric(calls.get("volume"), errors="coerce").fillna(0.0)
-    puts["vol_num"] = pd.to_numeric(puts.get("volume"), errors="coerce").fillna(0.0)
-
-    sum_call_oi = float(calls["oi_num"].sum())
-    sum_put_oi = float(puts["oi_num"].sum())
-    sum_call_vol = float(calls["vol_num"].sum())
-    sum_put_vol = float(puts["vol_num"].sum())
-
-    if sum_call_oi > 0:
-        out["pcr_oi"] = float(sum_put_oi / sum_call_oi)
-    if sum_call_vol > 0:
-        out["pcr_vol"] = float(sum_put_vol / sum_call_vol)
-
-    # OI walls
-    try:
-        call_wall = calls.sort_values("oi_num", ascending=False).iloc[0]
-        put_wall = puts.sort_values("oi_num", ascending=False).iloc[0]
-        out["call_wall_strike"] = int(call_wall.get("strike"))
-        out["put_wall_strike"] = int(put_wall.get("strike"))
-        spot = float(chain.spot)
-        if spot > 0:
-            if out["call_wall_strike"] >= spot:
-                out["call_wall_up_pct"] = float((out["call_wall_strike"] - spot) / spot)
-            if out["put_wall_strike"] <= spot:
-                out["put_wall_dn_pct"] = float((spot - out["put_wall_strike"]) / spot)
-    except Exception:
-        pass
-
-    # OTM skew (iv_put - iv_call), using same expiry as slice
-    try:
-        strikes = list(pd.to_numeric(calls.get("strike"), errors="coerce").dropna().astype(int).tolist())
-        step = _infer_strike_step(strikes)
-        atm = int(chain.atm)
-        c_strike = atm + int(SENTIMENT_SKEW_STEPS) * step
-        p_strike = atm - int(SENTIMENT_SKEW_STEPS) * step
-
-        calls_strike = pd.to_numeric(calls.get("strike"), errors="coerce").astype("Int64")
-        puts_strike = pd.to_numeric(puts.get("strike"), errors="coerce").astype("Int64")
-        c_df = calls[calls_strike == int(c_strike)]
-        p_df = puts[puts_strike == int(p_strike)]
-        if (not c_df.empty) and (not p_df.empty):
-            c_row = c_df.iloc[0].to_dict()
-            p_row = p_df.iloc[0].to_dict()
-            c_px = _mid_from_row(c_row)
-            p_px = _mid_from_row(p_row)
-            if c_px and p_px and c_px > 0 and p_px > 0:
-                T = time_to_expiry_years(chain.expiry)
-                ivc, okc = implied_volatility(float(c_px), float(chain.spot), int(c_strike), T, 0.06, "CE")
-                ivp, okp = implied_volatility(float(p_px), float(chain.spot), int(p_strike), T, 0.06, "PE")
-                if okc and okp and ivc and ivp:
-                    out["skew"] = float(ivp - ivc)
-    except Exception:
-        pass
-
+    underlyings = sorted(opt["name"].dropna().astype(str).str.upper().unique().tolist())
+    out = []
+    for u in underlyings:
+        spot = INDEX_SPOT_MAP.get(u, f"NSE:{u}")
+        out.append({"underlying": u, "spot": spot})
     return out
 
 
-def compute_market_context() -> dict:
-    """Compute a lightweight market context dict (bias/risk-off) using Kite data."""
-    ctx = {
-        "ts": datetime.now().isoformat(timespec="seconds"),
-        "bias": "NEUTRAL",          # BULLISH / BEARISH / NEUTRAL
-        "strength": 0.0,            # 0..1
-        "risk_off": False,
-        "vix": None,
-        "vix_pct": None,
-        "pcr_oi": None,
-        "skew": None,
-        "call_wall_up_pct": None,
-        "put_wall_dn_pct": None,
-        "notes": [],
-    }
+def build_lot_size_map() -> dict:
+    if not os.path.exists(INSTRUMENTS_CACHE_PATH):
+        return {}
+    df = pd.read_csv(INSTRUMENTS_CACHE_PATH)
+    df = df[df.get("segment", "").astype(str).str.upper() == "NFO-OPT"].copy()
+    if df.empty:
+        return {}
+    m = {}
+    for _, r in df.iterrows():
+        ts = str(r.get("tradingsymbol") or "").upper()
+        if not ts:
+            continue
+        try:
+            m[ts] = int(r.get("lot_size") or 1)
+        except Exception:
+            m[ts] = 1
+    return m
 
-    if not SENTIMENT_USE:
-        return ctx
 
-    # VIX percentile
+# ----------------------------
+# Market data
+# ----------------------------
+
+def fetch_history_cached(symbol: str, lookback_days: int, interval: str):
+    # expects your updated market_data.py to have fetch_history_cached + TTL obeyed by TRABOT_CACHE_TTL_MIN
+    from market_data import fetch_history_cached as _fh
+    return _fh(symbol, lookback_days=lookback_days, interval=interval, ttl_minutes=CACHE_TTL_MINUTES)
+
+
+# ----------------------------
+# Helpers
+# ----------------------------
+
+def _session_tag(last_ts: pd.Timestamp) -> str:
+    now = pd.Timestamp.now(tz=last_ts.tz) if last_ts.tzinfo else pd.Timestamp.now()
+    if last_ts.date() != now.date():
+        return "MARKET_CLOSED"
+    if (now - last_ts).total_seconds() < 60 * 60:
+        return "MID"
+    return "CLOSE"
+
+
+def _session_factor(tag: str) -> float:
+    t = (tag or "").upper()
+    if t == "MID":
+        return 1.02
+    if t == "CLOSE":
+        return 0.98
+    return 0.90
+
+
+def _bos_strength(df: pd.DataFrame, lookback: int = 20) -> Tuple[str, float]:
+    if df is None or df.empty or len(df) < lookback + 5:
+        return "NONE", 0.0
+
+    highs = df["high"].rolling(lookback).max()
+    lows = df["low"].rolling(lookback).min()
+    close = float(df["close"].iloc[-1])
+
+    hh = float(highs.iloc[-2]) if not math.isnan(float(highs.iloc[-2])) else float(highs.iloc[-1])
+    ll = float(lows.iloc[-2]) if not math.isnan(float(lows.iloc[-2])) else float(lows.iloc[-1])
+
+    tr = (df["high"] - df["low"]).rolling(14).mean()
+    atr = float(tr.iloc[-1]) if not math.isnan(float(tr.iloc[-1])) else max(1.0, float(df["high"].iloc[-1] - df["low"].iloc[-1]))
+
+    if close > hh:
+        return "BOS_UP", (close - hh) / max(atr, 1e-9)
+    if close < ll:
+        return "BOS_DOWN", (ll - close) / max(atr, 1e-9)
+    return "NONE", 0.0
+
+
+def _trend_strength(metrics: dict) -> float:
     try:
-        df_vix, _ = fetch_history_cached("NSE:INDIA VIX", lookback_days=120, interval="1d")
-        if not df_vix.empty:
-            vix = float(df_vix["close"].iloc[-1])
-            ctx["vix"] = vix
-            ew = pd.to_numeric(df_vix["close"], errors="coerce").ewm(span=10, adjust=False).mean()
-            ctx["vix_pct"] = _pct_rank_last(ew, window=30)
-    except Exception as e:
-        ctx["notes"].append(f"VIX fail: {e}")
-
-    # Index trend + chain
-    index_spot = INDEX_SPOT_MAP.get(SENTIMENT_INDEX_UNDERLYING, f"NSE:{SENTIMENT_INDEX_UNDERLYING}")
-    trend_side = "NO_TRADE"
-    adx_1h = None
-    try:
-        df_1h, _ = fetch_history_cached(index_spot, lookback_days=LOOKBACK_DAYS, interval="60m")
-        if not df_1h.empty:
-            sig_1h = compute_signal(
-                df=df_1h,
-                ema_fast=EMA_FAST, ema_slow=EMA_SLOW,
-                rsi_period=RSI_PERIOD, adx_period=ADX_PERIOD, adx_min=ADX_MIN,
-                atr_period=ATR_PERIOD,
-                stop_atr_mult=STOP_ATR_MULT, target_atr_mult=TARGET_ATR_MULT,
-            )
-            trend_side = str(sig_1h.side)
-            adx_1h = _safe_float(sig_1h.metrics.get("adx", None))
-    except Exception as e:
-        ctx["notes"].append(f"Index trend fail: {e}")
-
-    try:
-        chain = get_kite_chain_slice(
-            underlying=SENTIMENT_INDEX_UNDERLYING,
-            kite_spot_symbol=index_spot,
-            strike_step=0,
-            strikes_around_atm=max(10, STRIKES_AROUND_ATM * 2),
-            cache_path=INSTRUMENTS_CACHE_PATH,
-        )
-        m = _compute_chain_metrics(chain)
-        ctx.update({
-            "pcr_oi": m.get("pcr_oi"),
-            "skew": m.get("skew"),
-            "call_wall_up_pct": m.get("call_wall_up_pct"),
-            "put_wall_dn_pct": m.get("put_wall_dn_pct"),
-        })
-    except Exception as e:
-        ctx["notes"].append(f"Index chain fail: {e}")
-
-    # combine
-    s = 0.0
-    if trend_side == "LONG":
-        s += 0.80
-    elif trend_side == "SHORT":
-        s -= 0.80
-
-    pcr = ctx.get("pcr_oi")
-    if pcr is not None:
-        if pcr <= 0.85:
-            s += 0.25
-        elif pcr >= 1.15:
-            s -= 0.25
-
-    skew = ctx.get("skew")
-    if skew is not None:
-        if skew >= 0.08:
-            s -= 0.35
-        elif skew <= 0.00:
-            s += 0.10
-
-    vix_pct = ctx.get("vix_pct")
-    if vix_pct is not None:
-        if vix_pct >= 0.75:
-            s -= 0.35
-        elif vix_pct <= 0.30:
-            s += 0.10
-
-    ctx["risk_off"] = bool((vix_pct is not None and vix_pct >= 0.80) or (skew is not None and skew >= 0.10))
-
-    if s >= 0.35:
-        ctx["bias"] = "BULLISH"
-    elif s <= -0.35:
-        ctx["bias"] = "BEARISH"
-    else:
-        ctx["bias"] = "NEUTRAL"
-
-    ctx["strength"] = float(min(1.0, abs(s) / 1.2))
-
-    # append history
-    try:
-        os.makedirs("data", exist_ok=True)
-        row = {
-            "ts": ctx["ts"],
-            "bias": ctx["bias"],
-            "strength": ctx["strength"],
-            "risk_off": int(ctx["risk_off"]),
-            "vix": ctx.get("vix"),
-            "vix_pct": ctx.get("vix_pct"),
-            "pcr_oi": ctx.get("pcr_oi"),
-            "skew": ctx.get("skew"),
-            "call_wall_up_pct": ctx.get("call_wall_up_pct"),
-            "put_wall_dn_pct": ctx.get("put_wall_dn_pct"),
-            "index": SENTIMENT_INDEX_UNDERLYING,
-        }
-        hist_exists = os.path.exists(MARKET_SENTIMENT_HISTORY_CSV)
-        pd.DataFrame([row]).to_csv(MARKET_SENTIMENT_HISTORY_CSV, mode="a", header=not hist_exists, index=False)
+        close = float(metrics.get("close") or 0.0)
+        ema_fast = float(metrics.get("ema_fast") or 0.0)
+        ema_slow = float(metrics.get("ema_slow") or 0.0)
+        if close > 0:
+            return abs(ema_fast - ema_slow) / close
     except Exception:
         pass
-
-    if adx_1h is not None:
-        ctx["notes"].append(f"{SENTIMENT_INDEX_UNDERLYING} 1H trend={trend_side} ADX≈{adx_1h:.0f}")
-
-    return ctx
+    return 0.0
 
 
-def _market_multiplier(ctx: dict, side: str, htf_align: bool) -> tuple[float, list[str]]:
-    """Return (multiplier, reasons) to adjust raw score."""
-    if not ctx or (not SENTIMENT_USE):
-        return 1.0, []
+def _classify_regime_v21(metrics: dict, iv_pct: Optional[float]) -> str:
+    if iv_pct is not None and iv_pct >= VOLATILE_IV_PCTL:
+        return "VOLATILE"
+    ts = _trend_strength(metrics)
+    if ts >= TREND_STRENGTH_THRESHOLD:
+        return "TREND"
+    return "CHOP"
 
-    mult = 1.0
-    rs: list[str] = []
 
-    bias = ctx.get("bias", "NEUTRAL")
-    strength = float(ctx.get("strength", 0.0) or 0.0)
-    risk_off = bool(ctx.get("risk_off", False))
+
+def _sentiment_multiplier(ctx: MarketContext | None, side: str) -> float:
+    """
+    Returns a multiplier in ~[0.75, 1.25] based on market context.
+    - Boost trades aligned with ctx.bias (BULLISH/BEARISH) proportional to ctx.strength.
+    - If risk_off, slightly penalize LONG and slightly boost SHORT.
+    """
+    if ctx is None:
+        return 1.0
+
+    m = 1.0
+    try:
+        strength = float(ctx.strength or 0.0)
+    except Exception:
+        strength = 0.0
+
+    bias = str(ctx.bias or "NEUTRAL").upper()
+    side = str(side or "").upper()
+    risk_off = bool(getattr(ctx, "risk_off", False))
 
     if risk_off:
-        mult *= (0.92 - 0.04 * strength)
-        rs.append("Market risk-off (VIX/skew) → reduce aggressiveness")
+        m *= 0.88 if side == "LONG" else 1.05
 
     if bias == "BULLISH":
         if side == "LONG":
-            mult *= (1.04 + 0.04 * strength)
-            rs.append("Market bias bullish → boost LONGs")
-        elif side == "SHORT":
-            mult *= (0.92 - 0.04 * strength) if not htf_align else 0.95
-            rs.append("Market bias bullish → penalize SHORTs")
+            m *= 1.0 + 0.12 * strength
+        else:
+            m *= 1.0 - 0.10 * strength
     elif bias == "BEARISH":
         if side == "SHORT":
-            mult *= (1.04 + 0.04 * strength)
-            rs.append("Market bias bearish → boost SHORTs")
-        elif side == "LONG":
-            mult *= (0.92 - 0.04 * strength) if not htf_align else 0.95
-            rs.append("Market bias bearish → penalize LONGs")
+            m *= 1.0 + 0.12 * strength
+        else:
+            m *= 1.0 - 0.10 * strength
 
-    wall_near = float(ctx.get("call_wall_up_pct") or 0.0) if side == "LONG" else float(ctx.get("put_wall_dn_pct") or 0.0)
-    if wall_near and wall_near < SENTIMENT_WALL_NEAR_PCT:
-        mult *= 0.94
-        rs.append("Index OI wall is close → reduce conviction")
+    return max(0.75, min(1.25, float(m)))
 
-    return mult, rs
 
-# ---------------------------------------------------------------------
-# IMPORTANT:
-# The rest of the file below is identical to your original scan_options,
-# except where it:
-#   - computes market_ctx once in main()
-#   - passes market_ctx to _build_candidate()
-#   - applies multiplier inside _build_candidate()
-#   - adds sentiment columns into output rows
-#
-# Due to message size limit, I cannot paste the remaining ~700 lines here.
-# ---------------------------------------------------------------------
+def _risk_lots_from_stop(capital: float, entry: float, sl: float, lot_size: int) -> int:
+    if capital <= 0 or entry <= 0 or sl <= 0 or lot_size <= 0:
+        return 0
+    loss_per_unit = max(0.0, entry - sl)
+    if loss_per_unit <= 1e-9:
+        return 0
+    risk_rupees = float(capital) * float(RISK_PER_TRADE_PCT)
+    lots = int(risk_rupees // (loss_per_unit * lot_size))
+    return max(0, lots)
+
+
+def _score_strike_rows(df_side: pd.DataFrame, atm: int) -> pd.DataFrame:
+    x = df_side.copy()
+
+    x["oi_num"] = pd.to_numeric(x.get("oi"), errors="coerce").fillna(0.0)
+    x["vol_num"] = pd.to_numeric(x.get("volume"), errors="coerce").fillna(0.0)
+
+    x["bid_num"] = pd.to_numeric(x.get("bid"), errors="coerce")
+    x["ask_num"] = pd.to_numeric(x.get("ask"), errors="coerce")
+    x["mid"] = (x["bid_num"] + x["ask_num"]) / 2.0
+
+    x["spread_pct"] = (x["ask_num"] - x["bid_num"]) / x["mid"]
+    x["spread_pct"] = x["spread_pct"].replace([math.inf, -math.inf], math.nan)
+    x["spread_pct"] = x["spread_pct"].clip(lower=0.0, upper=0.80)
+
+    x["liq"] = (x["oi_num"].add(1).apply(math.log)) * 0.7 + (x["vol_num"].add(1).apply(math.log)) * 0.3
+    liq_max = float(x["liq"].max()) if len(x) else 1.0
+    if liq_max <= 0:
+        liq_max = 1.0
+    x["liq_norm"] = x["liq"] / liq_max
+
+    x["dist_atm"] = (pd.to_numeric(x["strike"], errors="coerce") - float(atm)).abs()
+    x["mny_score"] = 1.0 / (1.0 + (x["dist_atm"] / max(atm, 1.0)) * 20.0)
+
+    sp = x["spread_pct"].fillna(0.05).clip(lower=0.0, upper=0.30)
+    x["spread_pen"] = (sp / 0.02).clip(lower=0.0, upper=6.0)
+
+    x["strike_score"] = (x["liq_norm"] * 0.65 + x["mny_score"] * 0.35) - (x["spread_pen"] * 0.15)
+    return x
+
+
+def _pick_best_contract(chain, want_right: str) -> dict | None:
+    df_side = chain.calls if want_right == "CE" else chain.puts
+    if df_side.empty:
+        return None
+    scored = _score_strike_rows(df_side, atm=int(chain.atm))
+    scored = scored.dropna(subset=["bid_num", "ask_num"], how="any")
+
+    # Expert liquidity gates
+    scored = scored[
+        (scored["mid"] >= MIN_MID_PRICE) &
+        (scored["spread_pct"].fillna(1.0) <= MAX_SPREAD_PCT) &
+        (scored["oi_num"] >= MIN_OI) &
+        (scored["vol_num"] >= MIN_VOL)
+    ].copy()
+
+    if scored.empty:
+        return None
+    return scored.sort_values("strike_score", ascending=False).iloc[0].to_dict()
+
+
+def _compute_iv_and_greeks(spot: float, expiry: str, right: str, strike: int, price: float):
+    T = time_to_expiry_years(expiry)
+    iv, ok = implied_volatility(price, spot, strike, T, RISK_FREE, right)
+    conf = "high"
+    if (not ok) or iv is None or iv < 0.05 or iv > 2.50:
+        conf = "low"
+    if iv is None:
+        iv = 0.50
+    g = greeks(spot, strike, T, RISK_FREE, iv, right)
+    dte = max(0, int(round(T * 365)))
+    return float(iv), g, conf, dte
+
+
+def _append_atm_iv_snapshot(underlying: str, chain) -> tuple[float | None, str]:
+    best = None
+    best_dist = 1e18
+    for df_side, right in [(chain.calls, "CE"), (chain.puts, "PE")]:
+        if df_side is None or df_side.empty:
+            continue
+        tmp = df_side.copy()
+        tmp["dist"] = (pd.to_numeric(tmp["strike"], errors="coerce") - float(chain.atm)).abs()
+        tmp = tmp.dropna(subset=["dist"])
+        if tmp.empty:
+            continue
+        row = tmp.sort_values("dist").iloc[0].to_dict()
+        dist = float(row.get("dist", 1e18))
+        if dist < best_dist:
+            best_dist = dist
+            best = (row, right)
+
+    if not best:
+        return None, "low"
+
+    row, right = best
+    strike = int(row.get("strike"))
+    tsym = str(row.get("tradingsymbol"))
+    bid = pd.to_numeric(row.get("bid"), errors="coerce")
+    ask = pd.to_numeric(row.get("ask"), errors="coerce")
+    mid = (bid + ask) / 2.0
+    px = float(mid) if mid == mid and mid > 0 else float(row.get("last_price") or 0.0)
+    if px <= 0:
+        return None, "low"
+
+    iv, _, conf, _ = _compute_iv_and_greeks(float(chain.spot), chain.expiry, right, strike, px)
+
+    append_iv_snapshot({
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "underlying": underlying,
+        "tradingsymbol": tsym,
+        "expiry": chain.expiry,
+        "strike": strike,
+        "right": right,
+        "spot": float(chain.spot),
+        "price": float(px),
+        "iv": float(iv),
+        "confidence": conf,
+    })
+    return float(iv), conf
+
+
+def _build_candidate(item: dict, lot_map: dict, market_ctx: MarketContext | None = None) -> dict | None:
+    df, used_interval = fetch_history_cached(item["spot"], lookback_days=LOOKBACK_DAYS, interval=INTERVAL)
+    if df.empty:
+        return None
+
+    sig = compute_signal(
+        df=df,
+        ema_fast=EMA_FAST, ema_slow=EMA_SLOW,
+        rsi_period=RSI_PERIOD, adx_period=ADX_PERIOD, adx_min=ADX_MIN,
+        atr_period=ATR_PERIOD,
+        stop_atr_mult=STOP_ATR_MULT, target_atr_mult=TARGET_ATR_MULT,
+    )
+
+    side = None
+    is_live = False
+    trigger_text = None
+
+    if sig.side in ("LONG", "SHORT"):
+        side = sig.side
+        is_live = True
+        trigger_text = "LIVE signal"
+        entry_u, stop_u, target_u = float(sig.entry), float(sig.stop), float(sig.target)
+    else:
+        ws = str(sig.metrics.get("watch_side", "NONE"))
+        wt = str(sig.metrics.get("watch_trigger", ""))
+        if ws in ("LONG", "SHORT") and wt:
+            side = ws
+            is_live = False
+            trigger_text = wt
+            entry_u = float(sig.metrics.get("watch_entry"))
+            stop_u = float(sig.metrics.get("watch_stop"))
+            target_u = float(sig.metrics.get("watch_target"))
+        else:
+            return None
+
+    last_ts = pd.Timestamp(df.index[-1])
+    sess = _session_tag(last_ts)
+    sess_factor = _session_factor(sess)
+
+    bos_tag, bos_strength = _bos_strength(df, lookback=20)
+
+    # HTF alignment (optional)
+    try:
+        df_1h, _ = fetch_history_cached(item["spot"], lookback_days=LOOKBACK_DAYS, interval=HTF_INTERVAL)
+        sig_1h = compute_signal(
+            df=df_1h,
+            ema_fast=EMA_FAST, ema_slow=EMA_SLOW,
+            rsi_period=RSI_PERIOD, adx_period=ADX_PERIOD, adx_min=ADX_MIN,
+            atr_period=ATR_PERIOD,
+            stop_atr_mult=STOP_ATR_MULT, target_atr_mult=TARGET_ATR_MULT,
+        )
+        htf_align = (sig_1h.side == "NO_TRADE") or (sig_1h.side == side)
+    except Exception:
+        htf_align = True
+
+    chain = get_kite_chain_slice(
+        underlying=item["underlying"],
+        kite_spot_symbol=item["spot"],
+        strike_step=0,
+        strikes_around_atm=STRIKES_AROUND_ATM,
+        cache_path=INSTRUMENTS_CACHE_PATH,
+        min_dte_days=MIN_DTE_DAYS,
+        max_dte_days=MAX_DTE_DAYS,
+    )
+
+    # Align to live spot
+    candle_close = float(sig.metrics.get("close", chain.spot))
+    delta_spot = float(chain.spot) - candle_close
+    entry_u += delta_spot
+    stop_u += delta_spot
+    target_u += delta_spot
+
+    # IV percentile
+    _append_atm_iv_snapshot(item["underlying"], chain)
+    pct, n, _ = iv_percentile(item["underlying"], window_days=IV_PCTL_WINDOW_DAYS, ewma_span=IV_EWMA_SPAN)
+
+    regime = _classify_regime_v21(sig.metrics, pct)
+
+    want_right = "CE" if side == "LONG" else "PE"
+    pick = _pick_best_contract(chain, want_right=want_right)
+    if not pick:
+        return None
+
+    strike = int(pick["strike"])
+    tsym = str(pick["tradingsymbol"])
+    kite_symbol = f"NFO:{tsym}"
+    lot = int(lot_map.get(tsym.upper(), 1))
+
+    bid = float(pick.get("bid_num")) if pick.get("bid_num") == pick.get("bid_num") else None
+    ask = float(pick.get("ask_num")) if pick.get("ask_num") == pick.get("ask_num") else None
+    ltp = float(pick.get("last_price")) if pick.get("last_price") == pick.get("last_price") else None
+    mid = float(pick.get("mid")) if pick.get("mid") == pick.get("mid") else None
+
+    spread_pct = float(pick.get("spread_pct")) if pick.get("spread_pct") == pick.get("spread_pct") else None
+
+    entry_opt = ask if ask is not None else ltp
+    if entry_opt is None or entry_opt <= 0:
+        return None
+
+    px_for_iv = mid if mid is not None and mid > 0 else float(entry_opt)
+    iv, g, greeks_conf, dte = _compute_iv_and_greeks(float(chain.spot), chain.expiry, want_right, strike, px_for_iv)
+
+    # Map underlying stop/target to option stop/target using delta (simple approximation)
+    delta_abs = abs(float(g.get("delta", 0.5)))
+    delta_abs = min(0.75, max(0.25, delta_abs))
+
+    risk_u = abs(entry_u - stop_u)
+    rew_u = abs(target_u - entry_u)
+
+    sl_opt = max(0.05, entry_opt - delta_abs * risk_u)
+    tgt_opt = entry_opt + delta_abs * rew_u
+
+    # Score (simple + data-centric)
+    adx = float(sig.metrics.get("adx", 0.0))
+    score = (0.8 + 0.02 * adx) * sess_factor
+    if is_live:
+        score += 0.3
+    if not htf_align:
+        score *= 0.85
+    if pct is not None:
+        if pct >= 0.70:
+            score *= 0.92
+        elif pct <= 0.30:
+            score *= 1.08
+    if dte <= EXPIRY_PENALTY_DTE:
+        score *= 0.75
+    if greeks_conf == "low":
+        score *= 0.85
+
+    # Sentiment overlay multiplier
+    mult = _sentiment_multiplier(market_ctx, side)
+    score *= float(mult)
+
+    score = score if side == "LONG" else -score
+
+    # Sizing
+    max_lots, _, _ = compute_max_lots(
+        capital=TRABOT_CAPITAL,
+        regime=regime,
+        confidence=greeks_conf,
+        risk_profile=TRABOT_RISK_PROFILE,
+        dte=int(dte),
+        spot=float(chain.spot),
+        option_price=float(entry_opt),
+        lot_size=int(lot),
+        delta=float(g.get("delta", 0.0)),
+        vega_1pct=float(g.get("vega_1pct", 0.0)),
+        theta_day=float(g.get("theta_day", 0.0)),
+    )
+    pass_caps = bool(max_lots >= 1)
+
+    # Stop-risk based lots (expert sizing)
+    risk_lots = _risk_lots_from_stop(TRABOT_CAPITAL, float(entry_opt), float(sl_opt), int(lot))
+    final_lots = int(min(int(max_lots), int(risk_lots))) if risk_lots > 0 else int(max_lots)
+    pass_caps = bool(final_lots >= 1)
+
+    # Explainability notes
+    notes = []
+    notes.append(f"adx={float(sig.metrics.get('adx',0.0) or 0.0):.1f}")
+    if pct is not None:
+        notes.append(f"ivp={float(pct):.2f}")
+    notes.append(f"dte={int(dte)}")
+    try:
+        notes.append(f"spr={float(spread_pct or 0.0):.3f}")
+    except Exception:
+        pass
+    notes_str = " | ".join(notes)
+
+    return {
+        "underlying": item["underlying"],
+        "spot_symbol": item["spot"],
+        "expiry": chain.expiry,
+        "dte": int(dte),
+        "regime": regime,
+        "side": side,
+        "is_live": bool(is_live),
+        "right": want_right,
+        "tradingsymbol": tsym,
+        "kite_symbol": kite_symbol,
+        "strike": strike,
+        "score": float(score),
+        "entry": float(entry_opt),
+        "sl": float(sl_opt),
+        "target": float(tgt_opt),
+        "time_stop_min": int(TIME_STOP_MIN),
+        "spread_pct": spread_pct,
+        "iv": float(iv),
+        "iv_pct": float(pct) if pct is not None else float("nan"),
+        "iv_samples": int(n),
+        "greeks_conf": greeks_conf,
+        "delta": float(g.get("delta", 0.0)),
+        "vega_1pct": float(g.get("vega_1pct", 0.0)),
+        "theta_day": float(g.get("theta_day", 0.0)),
+        "lot_size": int(lot),
+        "greeks_max_lots": int(max_lots),
+        "risk_lots": int(risk_lots),
+        "max_lots": int(final_lots),
+        "pass_caps": bool(pass_caps),
+        "sent_mult": float(mult),
+        "mkt_bias": getattr(market_ctx, "bias", None) if market_ctx else None,
+        "mkt_strength": getattr(market_ctx, "strength", None) if market_ctx else None,
+        "mkt_risk_off": getattr(market_ctx, "risk_off", None) if market_ctx else None,
+        "notes": notes_str,
+        "reason": trigger_text,
+        "bos": bos_tag,
+        "bos_strength": float(bos_strength),
+        "htf_align": bool(htf_align),
+        "session": sess,
+    }
+
+
+def _reco_row(c: dict, ts_str: str, run_id: str, source: str, bucket: str) -> dict:
+    action = "BUY_CE" if c["side"] == "LONG" else "BUY_PE"
+    if not c.get("is_live", True):
+        action = "WATCH_CE" if c["side"] == "LONG" else "WATCH_PE"
+    return {
+        "ts_reco": ts_str,
+        "run_id": run_id,
+        "source": source,
+        "bucket": bucket,
+        "action": action,
+        "underlying": c.get("underlying"),
+        "tradingsymbol": c.get("tradingsymbol"),
+        "kite_symbol": c.get("kite_symbol"),
+        "expiry": c.get("expiry"),
+        "dte": c.get("dte"),
+        "side": c.get("side"),
+        "entry": c.get("entry"),
+        "sl": c.get("sl"),
+        "target": c.get("target"),
+        "time_stop_min": c.get("time_stop_min", TIME_STOP_MIN),
+        "score": c.get("score"),
+        "regime": c.get("regime"),
+        "iv": c.get("iv"),
+        "iv_pct": c.get("iv_pct"),
+        "greeks_conf": c.get("greeks_conf"),
+        "delta": c.get("delta"),
+        "vega_1pct": c.get("vega_1pct"),
+        "theta_day": c.get("theta_day"),
+        "lot_size": c.get("lot_size"),
+        "max_lots": c.get("max_lots"),
+        "pass_caps": c.get("pass_caps"),
+        "reason": c.get("reason"),
+        "notes": c.get("notes"),
+        "sent_mult": c.get("sent_mult"),
+        "mkt_bias": c.get("mkt_bias"),
+        "mkt_strength": c.get("mkt_strength"),
+        "mkt_risk_off": c.get("mkt_risk_off"),
+    }
+
+
+def _print_top2(title: str, rows: list[dict]):
+    print(f"\n{title}")
+    if not rows:
+        print("  (none)")
+        return
+    for c in rows:
+        tag = "PASS" if c.get("pass_caps") else "NO_SIZE"
+        print(
+            f"  {c['tradingsymbol']:<22s} | {tag:<7s} lots={c.get('max_lots',0)} "
+            f"| entry={c['entry']:.2f} sl={c['sl']:.2f} tgt={c['target']:.2f} | score={c['score']:+.2f}"
+        )
+
+
+def _print_top10_min(title: str, rows: list[dict]):
+    print(f"\n{title}")
+    if not rows:
+        print("  (none)")
+        return
+    for i, c in enumerate(rows, 1):
+        print(f"  #{i:02d} {c['tradingsymbol']:<22s}  entry={c['entry']:.2f}  sl={c['sl']:.2f}  tgt={c['target']:.2f}")
+
+
+def main(mode: str = "intraday"):
+    run_ts = datetime.now()
+    ts_str = run_ts.isoformat(timespec="seconds")
+    run_id = make_run_id(run_ts)
+
+    # Mode-aware tuning (intraday vs swing). Overrides are applied to globals so helper functions reuse them.
+    mode = (mode or os.getenv("TRABOT_MODE", "intraday")).strip().lower()
+    if mode not in MODE_DEFAULTS:
+        mode = "intraday"
+    md = MODE_DEFAULTS[mode]
+
+    global INTERVAL, LOOKBACK_DAYS, STOP_ATR_MULT, TARGET_ATR_MULT, RISK_PER_TRADE_PCT, TIME_STOP_MIN
+    global MIN_DTE_DAYS, MAX_DTE_DAYS, HTF_INTERVAL
+
+    INTERVAL = os.getenv("INTERVAL", md["interval"]) or md["interval"]
+    LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", str(md["lookback_days"])) or md["lookback_days"])
+
+    STOP_ATR_MULT = float(os.getenv("STOP_ATR_MULT", str(md["stop_atr_mult"])) or md["stop_atr_mult"])
+    TARGET_ATR_MULT = float(os.getenv("TARGET_ATR_MULT", str(md["target_atr_mult"])) or md["target_atr_mult"])
+
+    TIME_STOP_MIN = int(os.getenv("TRABOT_TIME_STOP_MIN", str(md["time_stop_min"])) or md["time_stop_min"])
+    MIN_DTE_DAYS = int(os.getenv("TRABOT_MIN_DTE_DAYS", str(md["min_dte"])) or md["min_dte"])
+    max_dte_env = os.getenv("TRABOT_MAX_DTE_DAYS", str(md["max_dte"] if md["max_dte"] is not None else "")).strip()
+    MAX_DTE_DAYS = int(max_dte_env) if max_dte_env else None
+
+    RISK_PER_TRADE_PCT = float(os.getenv("TRABOT_RISK_PER_TRADE_PCT", str(md["risk_pct"])) or md["risk_pct"])
+    HTF_INTERVAL = os.getenv("TRABOT_HTF_INTERVAL", md["htf_interval"]) or md["htf_interval"]
+
+    suffix = f"_{mode}"
+
+    universe = build_universe_all_options()
+    total = len(universe)
+    if total == 0:
+        print("Universe is empty (no options found).")
+        return
+
+    lot_map = build_lot_size_map()
+
+
+    # Market sentiment context (computed once per run)
+    market_ctx: MarketContext | None = None
+    if SENTIMENT_ENABLED:
+        try:
+            market_ctx = compute_market_context(
+                instruments_cache_path=INSTRUMENTS_CACHE_PATH,
+                index_underlying=SENTIMENT_INDEX_UNDERLYING,
+                index_spot_symbol=SENTIMENT_INDEX_SPOT,
+                strikes_around_atm=12,
+                skew_steps=4,
+                lookback_days=30,
+                interval=HTF_INTERVAL,
+                ema_fast=EMA_FAST,
+                ema_slow=EMA_SLOW,
+                rsi_period=RSI_PERIOD,
+                adx_period=ADX_PERIOD,
+                adx_min=ADX_MIN,
+                atr_period=ATR_PERIOD,
+                stop_atr_mult=STOP_ATR_MULT,
+                target_atr_mult=TARGET_ATR_MULT,
+            )
+            append_market_context(market_ctx)
+            print(f"Market ctx: bias={market_ctx.bias} strength={market_ctx.strength:.2f} risk_off={market_ctx.risk_off}")
+        except Exception as e:
+            print(f"[sentiment] skipped: {e}")
+            market_ctx = None
+
+    start = max(0, UNIVERSE_START)
+    end = total if UNIVERSE_COUNT is None else min(total, start + UNIVERSE_COUNT)
+    universe = universe[start:end]
+
+    print(f"Universe: {total} option-underlyings found in Kite (NFO-OPT). mode={mode}")
+    print(f"Scanning slice: [{start}:{end}]  (count={len(universe)})")
+    print(f"Strike window: ATM ± {STRIKES_AROUND_ATM} steps | Candle cache TTL: {CACHE_TTL_MINUTES} min")
+    print(f"Capital: ₹{TRABOT_CAPITAL:,.0f} | Risk profile: {TRABOT_RISK_PROFILE}")
+    print(f"Run: {ts_str}  (run_id={run_id})\n")
+
+    cands = []
+    for item in universe:
+        try:
+            c = _build_candidate(item, lot_map=lot_map, market_ctx=market_ctx)
+            if c:
+                cands.append(c)
+        except Exception as e:
+            print(f"[skip] {item['underlying']}: {e}")
+
+        if SLEEP_BETWEEN_SYMBOLS > 0:
+            time.sleep(SLEEP_BETWEEN_SYMBOLS)
+
+    if not cands:
+        print("No candidates found in this slice.")
+        return
+
+    # Prefer tradable first (pass_caps); fall back to all
+    tradable = [c for c in cands if c.get("pass_caps")]
+    if not tradable:
+        tradable = cands
+
+    bullish = sorted([c for c in tradable if c["side"] == "LONG"], key=lambda x: float(x["score"]), reverse=True)
+    bearish = sorted([c for c in tradable if c["side"] == "SHORT"], key=lambda x: float(x["score"]))  # most negative first
+
+    top2_buy = bullish[:TOP2]
+    top2_sell = bearish[:TOP2]
+
+    overall = sorted(tradable, key=lambda x: abs(float(x["score"])), reverse=True)
+    top10 = overall[:TOP10]
+
+    # ---- Print minimal actionable output ----
+    _print_top2("TOP 2 BUY (Bullish: Buy CE)", top2_buy)
+    _print_top2("TOP 2 SELL (Bearish: Buy PE)", top2_sell)
+    _print_top10_min(f"TOP {TOP10} OVERALL (entry/sl/target only)", top10)
+
+    # ---- Save outputs (latest + timestamped snapshot) ----
+    os.makedirs("data", exist_ok=True)
+
+    # Full scan results (latest + snapshot)
+    df_all = pd.DataFrame(cands)
+    df_all.to_csv(f"data/options_scan_results_v22{suffix}.csv", index=False)
+    df_all.to_csv(f"data/options_scan_results_v22_{run_id}.csv", index=False)
+
+    # Top10 minimal file (latest + snapshot)
+    df_top10_min = pd.DataFrame([{
+        "ts_reco": ts_str,
+        "tradingsymbol": c["tradingsymbol"],
+        "side": c["side"],
+        "entry": c["entry"],
+        "sl": c["sl"],
+        "target": c["target"],
+    } for c in top10])
+    df_top10_min.to_csv(f"data/options_top10_v22{suffix}.csv", index=False)
+    df_top10_min.to_csv(f"data/options_top10_v22_{run_id}.csv", index=False)
+
+    # Combined reco snapshot (top2+top10)
+    reco_rows = []
+    for c in top2_buy:
+        reco_rows.append(_reco_row(c, ts_str, run_id, "scan_options_v22", "TOP2_BUY"))
+    for c in top2_sell:
+        reco_rows.append(_reco_row(c, ts_str, run_id, "scan_options_v22", "TOP2_SELL"))
+    for c in top10:
+        reco_rows.append(_reco_row(c, ts_str, run_id, "scan_options_v22", f"TOP{TOP10}_OVERALL"))
+
+    # Append-only history (never overwritten)
+    append_history(reco_rows, path=os.getenv("TRABOT_RECO_HISTORY", "data/reco_history.csv"))
+
+    # Latest + per-run snapshot of recommendations
+    save_snapshot(reco_rows, f"data/reco_v22_{run_id}.csv")
+    save_snapshot(reco_rows, f"data/reco_latest_v22{suffix}.csv")
+
+    print(f"\nSaved: data/options_scan_results_v22{suffix}.csv")
+    print(f"Saved: data/options_scan_results_v22_{run_id}.csv")
+    print(f"Saved: data/options_top10_v22{suffix}.csv")
+    print(f"Saved: data/options_top10_v22_{run_id}.csv")
+    print(f"Saved: data/reco_latest_v22{suffix}.csv")
+    print(f"Saved: data/reco_v22_{run_id}.csv")
+    print(f"Appended: data/reco_history.csv (append-only)\n")
+
+    # Lookup
+    if LOOKUP_SYMBOL:
+        mp = {str(c["tradingsymbol"]).upper(): i + 1 for i, c in enumerate(overall)}
+        if LOOKUP_SYMBOL in mp:
+            i = mp[LOOKUP_SYMBOL]
+            c = next(x for x in overall if str(x["tradingsymbol"]).upper() == LOOKUP_SYMBOL)
+            print(f"LOOKUP: {LOOKUP_SYMBOL} ranked #{i} (by |score|). entry={c['entry']:.2f} sl={c['sl']:.2f} tgt={c['target']:.2f}")
+        else:
+            print(f"LOOKUP: {LOOKUP_SYMBOL} not found in this scan.")
+
+    print("NOTE: Research/education only. Not financial advice.")
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", choices=["intraday", "swing"], default=os.getenv("TRABOT_MODE", "intraday"))
+    args = ap.parse_args()
+    main(mode=args.mode)

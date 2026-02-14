@@ -1,3 +1,20 @@
+from __future__ import annotations
+
+"""patterns.py
+
+Pattern / setup idea generator for Trabot.
+
+Fixes / improvements (v2.2.x):
+- Works with either:
+    - df columns open/high/low/close (+ optional datetime column), OR
+    - df columns Open/High/Low/Close, OR
+    - df index as DatetimeIndex
+- Adds safe datetime handling (uses index when no datetime column).
+- Relies on indicators.zscore() (now implemented).
+
+Educational tool only – not financial advice.
+"""
+
 from dataclasses import dataclass
 import pandas as pd
 import numpy as np
@@ -26,19 +43,55 @@ def _safe(v, default=0.0) -> float:
         return float(default)
 
 
+def _get_series(df: pd.DataFrame, name: str) -> pd.Series:
+    # case-insensitive column getter
+    cols = {c.lower(): c for c in df.columns}
+    if name.lower() in cols:
+        return pd.to_numeric(df[cols[name.lower()]], errors="coerce")
+    raise KeyError(f"Missing column '{name}'. Have={list(df.columns)}")
+
+
+def _as_working_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy with lowercase open/high/low/close columns."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    cols = {c.lower(): c for c in out.columns}
+    mapping = {}
+    for k in ("open", "high", "low", "close", "volume"):
+        if k in cols:
+            mapping[cols[k]] = k
+        elif k.capitalize() in out.columns:
+            mapping[k.capitalize()] = k
+    out = out.rename(columns=mapping)
+    return out
+
+
+def _get_dt(df: pd.DataFrame, i: int) -> pd.Timestamp:
+    # Try explicit column
+    for col in ("datetime", "Datetime", "date", "Date", "timestamp", "Timestamp"):
+        if col in df.columns:
+            return pd.Timestamp(df[col].iloc[i])
+    # Fallback to index
+    if isinstance(df.index, pd.DatetimeIndex):
+        return pd.Timestamp(df.index[i])
+    # Last resort: attempt parse from index value
+    return pd.Timestamp(df.index[i])
+
+
 def _in_session(ts: pd.Timestamp) -> bool:
-    # Simple India cash session-ish filter (demo-friendly)
-    # Keep 09:30 to 15:15
+    """Simple India cash-session-ish filter: 09:30 to 15:15 IST (naive)."""
+    try:
+        ts = pd.Timestamp(ts)
+    except Exception:
+        return False
     h, m = ts.hour, ts.minute
     mins = h * 60 + m
     return (9 * 60 + 30) <= mins <= (15 * 60 + 15)
 
 
 def _atr_multipliers(regime: str):
-    """
-    Adaptive stops/targets based on volatility regime.
-    In LOW_VOL, widen stops a bit and reduce targets so noise doesn't kill trades.
-    """
+    """Adaptive stops/targets based on volatility regime."""
     if regime == "LOW_VOL":
         return 1.8, 2.0   # stop_mult, target_mult
     if regime == "MID_VOL":
@@ -156,7 +209,6 @@ def _volatility_squeeze(df: pd.DataFrame, i: int, regime: str):
     if i < 120:
         return None
 
-    # In LOW_VOL, squeezes are common but direction is noisy -> require stronger squeeze
     squeeze_threshold = -1.3 if regime == "LOW_VOL" else -1.0
 
     mid = close.rolling(20).mean()
@@ -192,12 +244,22 @@ def _volatility_squeeze(df: pd.DataFrame, i: int, regime: str):
 
 
 def generate_ideas(df: pd.DataFrame, symbol: str, scan_last_bars: int = 200, regime: str = "MID_VOL"):
+    """Generate TradeIdea list for last scan_last_bars."""
+    if df is None or df.empty:
+        return []
+
+    df = _as_working_df(df)
+    # Ensure required columns exist
+    for c in ("high", "low", "close"):
+        if c not in df.columns:
+            raise KeyError(f"patterns.generate_ideas requires '{c}' column")
+
     ideas = []
     n = len(df)
-    start = max(0, n - scan_last_bars)
+    start = max(0, n - int(scan_last_bars))
 
     for i in range(start, n):
-        ts = df["datetime"].iloc[i]
+        ts = _get_dt(df, i)
         if not _in_session(ts):
             continue
 
@@ -207,14 +269,14 @@ def generate_ideas(df: pd.DataFrame, symbol: str, scan_last_bars: int = 200, reg
                 pattern, side, entry, stop, target, conf = out
                 ideas.append(
                     TradeIdea(
-                        symbol=symbol,
-                        pattern=pattern,
-                        side=side,
+                        symbol=str(symbol),
+                        pattern=str(pattern),
+                        side=str(side),
                         entry=float(entry),
                         stop=float(stop),
                         target=float(target),
                         confidence=float(conf),
-                        at_index=i,
+                        at_index=int(i),
                     )
                 )
 

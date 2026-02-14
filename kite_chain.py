@@ -1,5 +1,19 @@
 from __future__ import annotations
 
+"""kite_chain.py
+
+Option-chain slice builder for Zerodha Kite (NFO options).
+
+v2.2.x upgrades:
+- Expiry selection supports DTE band (min_dte_days, max_dte_days) instead of always nearest expiry.
+  This is critical to support both:
+    - intraday (0–7 DTE typical)
+    - swing (4–14 DTE typical)
+- Backwards compatible defaults keep existing behavior.
+
+Educational tool only – not financial advice.
+"""
+
 from dataclasses import dataclass
 from typing import Optional, List
 import os
@@ -22,6 +36,8 @@ class ChainSlice:
 
 
 def _today_ist_date() -> dt.date:
+    # Note: system timezone on your machine should be IST for perfect DTE.
+    # For DTE gating, a 1-day drift rarely matters; for precision you can localize explicitly.
     return dt.date.today()
 
 
@@ -43,24 +59,36 @@ def _load_or_fetch_instruments(cache_path: str) -> pd.DataFrame:
     return df
 
 
-def _pick_nearest_expiry(df_opt: pd.DataFrame, min_dte_days: int = 1) -> Optional[dt.date]:
+def _pick_expiry_by_dte(df_opt: pd.DataFrame, min_dte_days: int = 0, max_dte_days: Optional[int] = None) -> Optional[dt.date]:
+    """Pick the nearest expiry within [min_dte_days, max_dte_days]."""
     if df_opt.empty:
         return None
 
-    exp = pd.to_datetime(df_opt["expiry"], errors="coerce").dt.date
     tmp = df_opt.copy()
-    tmp["expiry_norm"] = exp
+    tmp["expiry_norm"] = pd.to_datetime(tmp["expiry"], errors="coerce").dt.date
 
     today = _today_ist_date()
     tmp["dte"] = tmp["expiry_norm"].apply(lambda d: (d - today).days if pd.notna(d) else -999)
 
-    candidates = tmp[tmp["dte"] >= min_dte_days]["expiry_norm"].dropna().unique()
-    if len(candidates) == 0:
-        candidates = tmp[tmp["dte"] >= 0]["expiry_norm"].dropna().unique()
-        if len(candidates) == 0:
-            return None
+    # 1) Try within band
+    band = tmp[tmp["dte"] >= int(min_dte_days)].copy()
+    if max_dte_days is not None:
+        band = band[band["dte"] <= int(max_dte_days)].copy()
+    candidates = band["expiry_norm"].dropna().unique().tolist()
+    if candidates:
+        return sorted(candidates)[0]
 
-    return sorted(candidates)[0]
+    # 2) Fallback: nearest expiry >= min_dte
+    candidates = tmp[tmp["dte"] >= int(min_dte_days)]["expiry_norm"].dropna().unique().tolist()
+    if candidates:
+        return sorted(candidates)[0]
+
+    # 3) Last resort: nearest expiry >= 0
+    candidates = tmp[tmp["dte"] >= 0]["expiry_norm"].dropna().unique().tolist()
+    if candidates:
+        return sorted(candidates)[0]
+
+    return None
 
 
 def _batch(lst: List[str], n: int = 150):
@@ -85,11 +113,19 @@ def get_kite_chain_slice(
     strike_step: int,
     strikes_around_atm: int,
     cache_path: str,
+    min_dte_days: int = 0,
+    max_dte_days: Optional[int] = None,
 ) -> ChainSlice:
-    """
+    """Build a tight chain slice around ATM for a selected expiry.
+
     strike_step:
-      - pass a real step (NIFTY=50, BANKNIFTY=100) OR
+      - pass a real step (NIFTY=50, BANKNIFTY=100), OR
       - pass 0 to auto-infer from available strikes (works for stocks)
+
+    min_dte_days/max_dte_days:
+      - Choose expiry by DTE band. Example:
+        intraday: min=0 max=7
+        swing:    min=4 max=14
     """
     kite = get_kite()
     instruments = _load_or_fetch_instruments(cache_path)
@@ -108,7 +144,7 @@ def get_kite_chain_slice(
     if df_opt.empty:
         raise RuntimeError(f"No options found for {underlying} in Kite instruments dump.")
 
-    expiry_date = _pick_nearest_expiry(df_opt, min_dte_days=1)
+    expiry_date = _pick_expiry_by_dte(df_opt, min_dte_days=min_dte_days, max_dte_days=max_dte_days)
     if not expiry_date:
         raise RuntimeError("Could not determine a valid expiry from instruments dump.")
 
@@ -128,8 +164,8 @@ def get_kite_chain_slice(
 
     # Compute ATM from inferred/known step
     atm = int(round(spot / strike_step) * strike_step)
-    lo = atm - strikes_around_atm * strike_step
-    hi = atm + strikes_around_atm * strike_step
+    lo = atm - int(strikes_around_atm) * strike_step
+    hi = atm + int(strikes_around_atm) * strike_step
 
     df_opt = df_opt[(df_opt["strike_int"] >= lo) & (df_opt["strike_int"] <= hi)].copy()
     if df_opt.empty:
@@ -141,14 +177,13 @@ def get_kite_chain_slice(
             (pd.to_datetime(instruments["expiry"], errors="coerce").dt.date == expiry_date)
         ].copy()
         df_opt["strike_int"] = pd.to_numeric(df_opt["strike"], errors="coerce").round(0).astype("Int64")
-        # pick nearest 2*strikes_around_atm+1 strikes around spot
         strikes_all = sorted(df_opt["strike_int"].dropna().astype(int).unique().tolist())
         if not strikes_all:
             raise RuntimeError("No strikes available after fallback.")
         nearest = min(strikes_all, key=lambda s: abs(s - spot))
         atm = int(nearest)
-        lo = atm - strikes_around_atm * strike_step
-        hi = atm + strikes_around_atm * strike_step
+        lo = atm - int(strikes_around_atm) * strike_step
+        hi = atm + int(strikes_around_atm) * strike_step
         df_opt = df_opt[(df_opt["strike_int"] >= lo) & (df_opt["strike_int"] <= hi)].copy()
 
     df_opt["strike"] = df_opt["strike_int"].astype(int)
@@ -183,7 +218,6 @@ def get_kite_chain_slice(
     extra = pd.DataFrame(rows, columns=["kite_symbol", "last_price", "oi", "volume", "bid", "ask"])
     merged = df_opt.merge(extra, on="kite_symbol", how="left")
 
-    # Numeric + LTP fallback = mid(bid,ask)
     merged["last_price"] = pd.to_numeric(merged.get("last_price"), errors="coerce")
     merged["bid"] = pd.to_numeric(merged.get("bid"), errors="coerce")
     merged["ask"] = pd.to_numeric(merged.get("ask"), errors="coerce")
