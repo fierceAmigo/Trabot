@@ -100,18 +100,23 @@ MIN_VOL = int(os.getenv("TRABOT_MIN_VOL", "5000"))
 RISK_PER_TRADE_PCT = float(os.getenv("TRABOT_RISK_PER_TRADE_PCT", "0.015"))
 TIME_STOP_MIN = int(os.getenv("TRABOT_TIME_STOP_MIN", "90"))
 
-# --- Stop/target model controls (v2.3) ---
-STOP_MODEL = os.getenv("TRABOT_STOP_MODEL", "premium").strip().lower()  # premium | delta
-MIN_SL_PCT = float(os.getenv("TRABOT_MIN_SL_PCT", "0.25"))
-MAX_SL_PCT = float(os.getenv("TRABOT_MAX_SL_PCT", "0.45"))
-SL_PCT_MULT = float(os.getenv("TRABOT_SL_PCT_MULT", "2.0"))
-TGT_PCT_MULT = float(os.getenv("TRABOT_TGT_PCT_MULT", "3.0"))
-TGT_TO_SL_RATIO = float(os.getenv("TRABOT_TGT_TO_SL_RATIO", "1.8"))
+# --- Tradeability / stop model knobs (v2.3+) ---
+# If you keep getting "death by stop-loss", switch to premium-based stops and/or tighten regime gates.
+STOP_MODEL = os.getenv("TRABOT_STOP_MODEL", "premium").strip().lower()  # "premium" or "delta"
+BASE_SL_PCT_INTRADAY = float(os.getenv("TRABOT_BASE_SL_PCT_INTRADAY", "0.35"))
+BASE_SL_PCT_SWING = float(os.getenv("TRABOT_BASE_SL_PCT_SWING", "0.45"))
+MIN_SL_PCT = float(os.getenv("TRABOT_MIN_SL_PCT", "0.25"))   # at least this wide (25% premium)
+MAX_SL_PCT = float(os.getenv("TRABOT_MAX_SL_PCT", "0.55"))   # at most this wide (55% premium)
+TGT_TO_SL_RATIO = float(os.getenv("TRABOT_TGT_TO_SL_RATIO", "2.0"))
+STOP_SPREAD_BUFFER_FRAC = float(os.getenv("TRABOT_STOP_SPREAD_BUFFER_FRAC", "0.25"))
 
-REQUIRE_HTF_ALIGN = os.getenv("TRABOT_REQUIRE_HTF_ALIGN", "1").strip().lower() not in ("0", "false", "no")
-SKIP_CHOP = os.getenv("TRABOT_SKIP_CHOP", "1").strip().lower() not in ("0", "false", "no")
-SKIP_RISK_OFF_LONG = os.getenv("TRABOT_SKIP_RISK_OFF_LONG", "1").strip().lower() not in ("0", "false", "no")
-HIGH_IV_BUY_BLOCK = float(os.getenv("TRABOT_HIGH_IV_BUY_BLOCK", "0.70"))
+SKIP_CHOP = os.getenv("TRABOT_SKIP_CHOP", "1").strip().lower() in ("1", "true", "yes")
+HIGH_IV_BUY_BLOCK = float(os.getenv("TRABOT_HIGH_IV_BUY_BLOCK", "0.75"))  # block BUY if iv_pct >= this
+SKIP_LONG_RISK_OFF = os.getenv("TRABOT_SKIP_LONG_RISK_OFF", "1").strip().lower() in ("1", "true", "yes")
+
+SKIP_UNSIZED = os.getenv("TRABOT_SKIP_UNSIZED", "1").strip().lower() in ("1", "true", "yes")  # drop pass_caps=False
+ALLOW_UNSIZED_FALLBACK = os.getenv("TRABOT_ALLOW_UNSIZED", "0").strip().lower() in ("1", "true", "yes")
+CURRENT_MODE = os.getenv("TRABOT_MODE", "intraday").strip().lower()
 
 # Expiry band (DTE) control (v2.2.x)
 MIN_DTE_DAYS = int(os.getenv("TRABOT_MIN_DTE_DAYS", "0"))
@@ -228,8 +233,13 @@ def _load_instruments_nfo(cache_path: str) -> pd.DataFrame:
 
 def build_universe_all_options() -> list[dict]:
     _ensure_dir(DATA_DIR)
+    kite = get_kite()
 
-    inst = _load_instruments_nfo(INSTRUMENTS_CACHE_PATH)
+    if os.path.exists(INSTRUMENTS_CACHE_PATH):
+        inst = pd.read_csv(INSTRUMENTS_CACHE_PATH)
+    else:
+        inst = pd.DataFrame(kite.instruments("NFO"))
+        inst.to_csv(INSTRUMENTS_CACHE_PATH, index=False)
 
     opt = inst[inst["segment"].astype(str).str.upper() == "NFO-OPT"].copy()
     if opt.empty:
@@ -549,9 +559,6 @@ def _build_candidate(item: dict, lot_map: dict, market_ctx: MarketContext | None
     except Exception:
         htf_align = True
 
-    if REQUIRE_HTF_ALIGN and not htf_align:
-        return None
-
     chain = get_kite_chain_slice(
         underlying=item["underlying"],
         kite_spot_symbol=item["spot"],
@@ -575,12 +582,12 @@ def _build_candidate(item: dict, lot_map: dict, market_ctx: MarketContext | None
 
     regime = _classify_regime_v21(sig.metrics, pct)
 
-    # Hard filters to reduce chop/IV stop-outs
+    # ---- Tradeability gates (reduce chop/IV stop-outs) ----
     if SKIP_CHOP and regime == "CHOP":
         return None
-    if market_ctx is not None and SKIP_RISK_OFF_LONG and side == "LONG" and bool(getattr(market_ctx, "risk_off", False)):
+    if pct is not None and pct == pct and float(pct) >= float(HIGH_IV_BUY_BLOCK):
         return None
-    if pct is not None and pct >= HIGH_IV_BUY_BLOCK and regime == "VOLATILE":
+    if market_ctx is not None and getattr(market_ctx, "risk_off", False) and side == "LONG" and SKIP_LONG_RISK_OFF:
         return None
 
     want_right = "CE" if side == "LONG" else "PE"
@@ -607,37 +614,46 @@ def _build_candidate(item: dict, lot_map: dict, market_ctx: MarketContext | None
     px_for_iv = mid if mid is not None and mid > 0 else float(entry_opt)
     iv, g, greeks_conf, dte = _compute_iv_and_greeks(float(chain.spot), chain.expiry, want_right, strike, px_for_iv)
 
-    # Option stop/target model
+    # Stop/target model
+    # - "delta" maps underlying stop/target into option premium via |delta| (often too tight intraday)
+    # - "premium" uses a premium-based stop (wider + more stable) but still respects the underlying-mapped distance
     delta_abs = abs(float(g.get("delta", 0.5)))
     delta_abs = min(0.75, max(0.25, delta_abs))
 
     risk_u = abs(entry_u - stop_u)
     rew_u = abs(target_u - entry_u)
 
-    if STOP_MODEL == "delta":
-        # Simple mapping (legacy v2.2)
-        sl_opt = max(0.05, entry_opt - delta_abs * risk_u)
-        tgt_opt = entry_opt + delta_abs * rew_u
-    else:
-        # Premium-aware model (v2.3): widen stops to survive normal option noise,
-        # while still tying risk/target to underlying move via delta.
-        move_opt = max(0.0, delta_abs * risk_u)
-        move_pct = (move_opt / entry_opt) if entry_opt > 0 else 0.0
+    base_sl = BASE_SL_PCT_INTRADAY if CURRENT_MODE == "intraday" else BASE_SL_PCT_SWING
+    sl_pct = float(base_sl)
+    if pct is not None and pct == pct:
+        # widen stop a bit in high-IV regimes; tighten slightly in low-IV regimes
+        sl_pct = float(base_sl) + 0.10 * (float(pct) - 0.50)
+    sl_pct = max(MIN_SL_PCT, min(MAX_SL_PCT, sl_pct))
 
-        sl_pct = move_pct * SL_PCT_MULT
-        sl_pct = max(MIN_SL_PCT, min(MAX_SL_PCT, sl_pct))
+    # Candidate stops from two perspectives
+    sl_delta = float(entry_opt) - float(delta_abs) * float(risk_u)
+    sl_prem = float(entry_opt) * (1.0 - float(sl_pct))
 
-        tgt_pct = max(sl_pct * TGT_TO_SL_RATIO, move_pct * TGT_PCT_MULT)
-        tgt_pct = max(0.20, min(1.50, tgt_pct))
+    # Choose stop
+    sl_opt = sl_delta if STOP_MODEL == "delta" else min(sl_delta, sl_prem)
 
-        sl_opt = max(0.05, entry_opt * (1.0 - sl_pct))
-        tgt_opt = entry_opt * (1.0 + tgt_pct)
+    # Clamp stop within [max-loss, min-loss] bounds (in premium terms)
+    sl_lo = float(entry_opt) * (1.0 - float(MAX_SL_PCT))  # widest allowed (lowest price)
+    sl_hi = float(entry_opt) * (1.0 - float(MIN_SL_PCT))  # tightest allowed (highest price)
+    sl_opt = min(max(float(sl_opt), float(sl_lo)), float(sl_hi))
 
-        # Spread buffer: if we're entering at ask, ensure SL isn't inside the spread.
-        if bid is not None and ask is not None and bid > 0 and ask > bid:
-            half_sp = (ask - bid) / 2.0
-            sl_opt = max(0.05, min(sl_opt, bid - half_sp))
-            tgt_opt = max(tgt_opt, entry_opt + half_sp)
+    # Spread buffer so we don't get stopped purely on bid/ask noise
+    if bid is not None and ask is not None and ask > bid:
+        spr = float(ask) - float(bid)
+        sl_opt = min(float(sl_opt), float(bid) - float(STOP_SPREAD_BUFFER_FRAC) * float(spr))
+        sl_opt = max(float(sl_opt), float(sl_lo))
+
+    sl_opt = max(0.05, float(sl_opt))
+
+    # Targets (keep at least a reward multiple relative to stop distance)
+    tgt_delta = float(entry_opt) + float(delta_abs) * float(rew_u)
+    tgt_prem = float(entry_opt) * (1.0 + float(sl_pct) * float(TGT_TO_SL_RATIO))
+    tgt_opt = tgt_delta if STOP_MODEL == "delta" else max(float(tgt_delta), float(tgt_prem))
 
     # Score (simple + data-centric)
     adx = float(sig.metrics.get("adx", 0.0))
@@ -683,6 +699,9 @@ def _build_candidate(item: dict, lot_map: dict, market_ctx: MarketContext | None
     final_lots = int(min(int(max_lots), int(risk_lots))) if risk_lots > 0 else int(max_lots)
     pass_caps = bool(final_lots >= 1)
 
+    if SKIP_UNSIZED and not pass_caps:
+        return None
+
     # Explainability notes
     notes = []
     notes.append(f"adx={float(sig.metrics.get('adx',0.0) or 0.0):.1f}")
@@ -702,9 +721,6 @@ def _build_candidate(item: dict, lot_map: dict, market_ctx: MarketContext | None
         "dte": int(dte),
         "regime": regime,
         "side": side,
-        "u_entry": float(entry_u),
-        "u_stop": float(stop_u),
-        "u_target": float(target_u),
         "is_live": bool(is_live),
         "right": want_right,
         "tradingsymbol": tsym,
@@ -757,9 +773,6 @@ def _reco_row(c: dict, ts_str: str, run_id: str, source: str, bucket: str) -> di
         "expiry": c.get("expiry"),
         "dte": c.get("dte"),
         "side": c.get("side"),
-        "u_entry": c.get("u_entry"),
-        "u_stop": c.get("u_stop"),
-        "u_target": c.get("u_target"),
         "entry": c.get("entry"),
         "sl": c.get("sl"),
         "target": c.get("target"),
@@ -816,6 +829,9 @@ def main(mode: str = "intraday"):
     if mode not in MODE_DEFAULTS:
         mode = "intraday"
     md = MODE_DEFAULTS[mode]
+
+    global CURRENT_MODE
+    CURRENT_MODE = mode
 
     global INTERVAL, LOOKBACK_DAYS, STOP_ATR_MULT, TARGET_ATR_MULT, RISK_PER_TRADE_PCT, TIME_STOP_MIN
     global MIN_DTE_DAYS, MAX_DTE_DAYS, HTF_INTERVAL
@@ -898,8 +914,20 @@ def main(mode: str = "intraday"):
         print("No candidates found in this slice.")
         return
 
-    # Prefer tradable first (pass_caps); fall back to all
+    # Prefer tradable first (pass_caps). By default we DO NOT fall back to unsized picks.
     tradable = [c for c in cands if c.get("pass_caps")]
+    if not tradable and not ALLOW_UNSIZED_FALLBACK:
+        print("No tradable candidates (pass_caps=True) for the current capital/risk caps.")
+        print("Try: increase TRABOT_CAPITAL (e.g., moderate=400000), scan index options, or set TRABOT_ALLOW_UNSIZED=1 (not recommended).")
+
+        # Still save the full scan results for inspection
+        os.makedirs("data", exist_ok=True)
+        df_all = pd.DataFrame(cands)
+        df_all.to_csv(f"data/options_scan_results_v22{suffix}.csv", index=False)
+        df_all.to_csv(f"data/options_scan_results_v22_{run_id}.csv", index=False)
+        print(f"\nSaved: data/options_scan_results_v22{suffix}.csv")
+        print(f"Saved: data/options_scan_results_v22_{run_id}.csv")
+        return
     if not tradable:
         tradable = cands
 
