@@ -36,6 +36,12 @@ from journal import append_history, save_snapshot, make_run_id
 
 
 DATA_DIR = os.getenv("TRABOT_DATA_DIR", "data")
+
+# Schema-stable reco history (prevents CSV field-count corruption)
+SCHEMA_VERSION = os.getenv("TRABOT_SCHEMA_VERSION", "v22_p1").strip()
+DEFAULT_RECO_HISTORY_PATH = os.path.join(DATA_DIR, f"reco_history_{SCHEMA_VERSION}.csv")
+RECO_HISTORY_PATH = os.getenv("TRABOT_RECO_HISTORY", DEFAULT_RECO_HISTORY_PATH)
+
 INSTRUMENTS_CACHE_PATH = os.getenv("INSTRUMENTS_CACHE_PATH", os.path.join(DATA_DIR, "kite_instruments_NFO.csv"))
 
 CACHE_TTL_MINUTES = int(os.getenv("TRABOT_CACHE_TTL_MIN", "5"))
@@ -516,7 +522,7 @@ def refine_levels(c: dict, opt_interval: str, opt_period: int, opt_bars: int, sl
         return c
 
 
-def reco_row(c: dict, ts_str: str, run_id: str, bucket: str) -> dict:
+def reco_row(c: dict, ts_str: str, run_id: str, bucket: str, mode: str) -> dict:
     if c.get("trade_ok"):
         action = "BUY_CE" if c["side"] == "LONG" else "BUY_PE"
     else:
@@ -524,6 +530,8 @@ def reco_row(c: dict, ts_str: str, run_id: str, bucket: str) -> dict:
 
     return {
         "ts_reco": ts_str,
+        "schema_version": SCHEMA_VERSION,
+        "mode": mode,
         "run_id": run_id,
         "source": "scan_global_v22",
         "bucket": bucket,
@@ -888,13 +896,13 @@ def main(mode: str = "intraday"):
 
     reco_rows = []
     for c in buy:
-        reco_rows.append(reco_row(c, ts_str, run_id, "TOP2_BUY"))
+        reco_rows.append(reco_row(c, ts_str, run_id, "TOP2_BUY", mode))
     for c in sell:
-        reco_rows.append(reco_row(c, ts_str, run_id, "TOP2_SELL"))
+        reco_rows.append(reco_row(c, ts_str, run_id, "TOP2_SELL", mode))
     for c in top10:
-        reco_rows.append(reco_row(c, ts_str, run_id, f"TOP{TOP10}_OVERALL"))
+        reco_rows.append(reco_row(c, ts_str, run_id, f"TOP{TOP10}_OVERALL", mode))
 
-    append_history(reco_rows, path=os.getenv("TRABOT_RECO_HISTORY", os.path.join(DATA_DIR, "reco_history.csv")))
+    append_history(reco_rows, path=RECO_HISTORY_PATH)
     save_snapshot(reco_rows, os.path.join(DATA_DIR, f"reco_latest_global_v22{suffix}.csv"))
     save_snapshot(reco_rows, os.path.join(DATA_DIR, f"reco_global_v22{suffix}_{run_id}.csv"))
 

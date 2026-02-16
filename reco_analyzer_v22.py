@@ -33,7 +33,11 @@ from iv_greeks import implied_volatility
 IST = "Asia/Kolkata"
 
 DATA_DIR = os.getenv("TRABOT_DATA_DIR", "data")
-HISTORY_PATH = os.getenv("TRABOT_RECO_HISTORY", os.path.join(DATA_DIR, "reco_history.csv"))
+
+# Schema-stable history (prevents CSV field-count corruption)
+SCHEMA_VERSION = os.getenv("TRABOT_SCHEMA_VERSION", "v22_p1").strip()
+DEFAULT_HISTORY_PATH = os.path.join(DATA_DIR, f"reco_history_{SCHEMA_VERSION}.csv")
+HISTORY_PATH = os.getenv("TRABOT_RECO_HISTORY", DEFAULT_HISTORY_PATH)
 INSTRUMENTS_CACHE_PATH = os.getenv("INSTRUMENTS_CACHE_PATH", os.path.join(DATA_DIR, "kite_instruments_NFO.csv"))
 CACHE_DIR = os.path.join(DATA_DIR, "reco_eval_cache_v22")
 
@@ -55,6 +59,43 @@ _STRIKE_RE = re.compile(r"(\d+)(CE|PE)$", re.IGNORECASE)
 
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
+
+
+
+def read_csv_safe(path: str, bad_lines: str = "skip") -> tuple[pd.DataFrame, dict]:
+    """
+    Read a CSV while handling mixed-schema / bad lines.
+
+    Returns: (df, meta) where meta includes an estimated number of skipped lines.
+    """
+    meta = {"path": path, "skipped_lines_est": 0, "parser_mode": "default"}
+    if bad_lines not in ("error", "skip"):
+        bad_lines = "skip"
+
+    # quick estimate for diagnostics
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            total_lines = sum(1 for _ in f)
+        meta["total_lines"] = total_lines
+    except Exception:
+        meta["total_lines"] = None
+
+    try:
+        df = pd.read_csv(path)
+        meta["parser_mode"] = "default"
+        return df, meta
+    except Exception as e:
+        # try python engine; optionally skip bad rows
+        on_bad = "skip" if bad_lines == "skip" else "error"
+        df = pd.read_csv(path, engine="python", on_bad_lines=on_bad)
+        meta["parser_mode"] = "python"
+        try:
+            if meta.get("total_lines") is not None:
+                meta["skipped_lines_est"] = max(0, int(meta["total_lines"]) - 1 - len(df))
+        except Exception:
+            pass
+        meta["last_error"] = str(e)
+        return df, meta
 
 
 def to_ist(ts) -> pd.Timestamp:
@@ -198,7 +239,25 @@ def t_years(exp_end: pd.Timestamp, at: pd.Timestamp) -> float:
     return sec / (365.0 * 24 * 3600)
 
 
-def evaluate_path_with_mfe_mae(opt_df: pd.DataFrame, ts_reco: pd.Timestamp, sl: float, target: float):
+def evaluate_path_with_mfe_mae(
+    opt_df: pd.DataFrame,
+    ts_reco: pd.Timestamp,
+    sl: float,
+    target: float,
+    spread_pct: float = 0.0,
+    fill_model: str = "realistic",
+    fill_k: float = 0.25,
+):
+    """
+    Evaluate a single recommendation on option candles.
+
+    Execution model (phase-5 baseline):
+      - optimistic: entry/exit at candle prices (k=0)
+      - realistic: entry worse + exit worse by k * spread_pct (default k=0.25)
+      - pessimistic: entry/exit penalized by full spread_pct (k=1)
+
+    Note: We still use candle HIGH/LOW for SL/Target hit detection (no bid/ask candle series).
+    """
     if opt_df is None or opt_df.empty:
         return {"status": "NO_CANDLES"}
 
@@ -210,79 +269,83 @@ def evaluate_path_with_mfe_mae(opt_df: pd.DataFrame, ts_reco: pd.Timestamp, sl: 
         return {"status": "NO_CANDLES_AFTER_RECO"}
 
     entry_ts = after.index[0]
-    entry_px = float(after.iloc[0]["open"])
-    if entry_px <= 0 or sl <= 0 or target <= 0:
+    entry_px_raw = float(after.iloc[0]["open"])
+    if entry_px_raw <= 0 or sl <= 0 or target <= 0:
         return {"status": "BAD_LEVELS"}
 
-    # MFE/MAE measured from entry until exit
-    max_high = entry_px
-    min_low = entry_px
+    sp = float(spread_pct or 0.0)
+    sp = max(0.0, min(sp, 0.80))
+    fm = (fill_model or "realistic").strip().lower()
+    k_eff = 0.0 if fm == "optimistic" else (1.0 if fm == "pessimistic" else float(fill_k))
+    k_eff = max(0.0, min(k_eff, 1.0))
 
-    hit = None
+    # For long option buys: pay up on entry, get worse on exit.
+    entry_px = entry_px_raw * (1.0 + k_eff * sp)
+
+    # MFE/MAE measured from entry until exit (using raw candle extrema vs fill-adjusted entry)
+    max_fav = 0.0
+    max_adv = 0.0
     exit_ts = None
-    exit_px = None
-    bars = 0
+    exit_px_raw = None
+    hit = "TIME_EXIT"
 
-    for t, row in after.iterrows():
-        bars += 1
-        lo = float(row["low"])
+    for idx, row in after.iterrows():
         hi = float(row["high"])
+        lo = float(row["low"])
 
-        max_high = max(max_high, hi)
-        min_low = min(min_low, lo)
+        max_fav = max(max_fav, hi - entry_px)
+        max_adv = min(max_adv, lo - entry_px)  # negative
 
-        sl_hit = lo <= sl
-        tgt_hit = hi >= target
-
-        if sl_hit and tgt_hit:
-            hit = "BOTH_SAME_BAR"
-            exit_ts = t
-            exit_px = float(sl)  # conservative
+        # SL/Target hit check (raw candle levels)
+        if lo <= sl:
+            hit = "STOP"
+            exit_ts = idx
+            exit_px_raw = float(sl)
             break
-        if tgt_hit:
+        if hi >= target:
             hit = "TARGET"
-            exit_ts = t
-            exit_px = float(target)
-            break
-        if sl_hit:
-            hit = "SL"
-            exit_ts = t
-            exit_px = float(sl)
+            exit_ts = idx
+            exit_px_raw = float(target)
             break
 
-    if hit is None:
-        hit = "TIME_EXIT"
+    if exit_ts is None:
         exit_ts = after.index[-1]
-        exit_px = float(after.iloc[-1]["close"])
+        exit_px_raw = float(after.iloc[-1]["close"])
+
+    # Exit fill (sell) worse by spread penalty
+    exit_px = float(exit_px_raw) * (1.0 - k_eff * sp)
 
     pnl = exit_px - entry_px
     pnl_pct = pnl / entry_px if entry_px > 0 else 0.0
 
-    mfe = max_high - entry_px
-    mae = min_low - entry_px  # negative if adverse
+    bars_to_exit = int(after.index.get_loc(exit_ts)) + 1
 
-    target_dist = target - entry_px
-    sl_dist = entry_px - sl
+    # Fractions
+    target_dist = max(1e-9, float(target) - float(entry_px_raw))
+    mfe_frac = max_fav / target_dist if target_dist > 0 else 0.0
 
-    mfe_frac = (mfe / target_dist) if target_dist > 1e-9 else None
-    mae_frac = (abs(mae) / sl_dist) if sl_dist > 1e-9 else None
+    sl_dist = max(1e-9, float(entry_px_raw) - float(sl))
+    mae_frac = abs(max_adv) / sl_dist if sl_dist > 0 else 0.0
 
     return {
         "status": "OK",
-        "entry_ts": entry_ts,
-        "entry_px": entry_px,
         "hit": hit,
+        "entry_ts": entry_ts,
         "exit_ts": exit_ts,
+        "entry_px": entry_px,
+        "entry_px_raw": entry_px_raw,
         "exit_px": exit_px,
+        "exit_px_raw": float(exit_px_raw),
         "pnl": pnl,
         "pnl_pct": pnl_pct,
-        "bars_to_exit": bars,
-        "mfe": mfe,
-        "mae": mae,
+        "bars_to_exit": bars_to_exit,
+        "mfe": max_fav,
+        "mae": max_adv,
         "mfe_frac_to_target": mfe_frac,
         "mae_frac_to_sl": mae_frac,
-        "max_high": max_high,
-        "min_low": min_low,
+        "fill_model": fm,
+        "fill_k": k_eff,
+        "spread_pct_used": sp,
     }
 
 
@@ -360,7 +423,34 @@ def summarize(df: pd.DataFrame) -> str:
         return "\n".join(lines)
 
     lines.append(f"Overall win-rate: {winrate(ok) * 100:.1f}%")
-    lines.append(f"Average PnL%: {ok['pnl_pct'].mean() * 100:.2f}%\n")
+    avg = float(ok["pnl_pct"].mean())
+    lines.append(f"Average PnL%: {avg * 100:.2f}%")
+
+    # risk-adjusted + drawdown (per-trade; assumes equal risk per reco)
+    rets = ok["pnl_pct"].astype(float).fillna(0.0).values
+    wins = rets[rets > 0]
+    losses_r = rets[rets < 0]
+
+    profit_factor = (wins.sum() / abs(losses_r.sum())) if losses_r.size and abs(losses_r.sum()) > 1e-12 else float("inf")
+    lines.append(f"Profit factor: {profit_factor:.2f}")
+
+    import numpy as np
+    mu = float(np.mean(rets))
+    sd = float(np.std(rets, ddof=1)) if len(rets) > 1 else 0.0
+    sharpe = (mu / sd * (len(rets) ** 0.5)) if sd > 1e-12 else float("nan")
+    neg = rets[rets < 0]
+    sd_down = float(np.std(neg, ddof=1)) if len(neg) > 1 else 0.0
+    sortino = (mu / sd_down * (len(rets) ** 0.5)) if sd_down > 1e-12 else float("nan")
+
+    # equity curve + max drawdown
+    eq = np.cumprod(1.0 + rets)
+    peak = np.maximum.accumulate(eq) if eq.size else np.array([1.0])
+    dd = (eq / peak) - 1.0 if eq.size else np.array([0.0])
+    max_dd = float(dd.min()) if dd.size else 0.0
+
+    lines.append(f"Sharpe (per-trade): {sharpe:.2f}" if sharpe == sharpe else "Sharpe (per-trade): n/a")
+    lines.append(f"Sortino (per-trade): {sortino:.2f}" if sortino == sortino else "Sortino (per-trade): n/a")
+    lines.append(f"Max drawdown: {max_dd * 100:.2f}%\n")
 
     lines.append("Outcome distribution:")
     for k, v in ok["hit"].value_counts().items():
@@ -410,6 +500,7 @@ def summarize(df: pd.DataFrame) -> str:
     grp("iv_bin", "By IV bin")
     grp("dte_bin", "By DTE bin")
     grp("delta_bin", "By delta bin")
+    grp("fill_model", "By fill model")
 
     return "\n".join(lines)
 
@@ -422,12 +513,17 @@ def main():
     ap.add_argument("--last_n", type=int, default=0)
     ap.add_argument("--from_date", default="")
     ap.add_argument("--include_watch", action="store_true")
+    ap.add_argument("--fill_model", choices=["optimistic", "realistic", "pessimistic"], default=os.getenv("TRABOT_FILL_MODEL", "realistic"))
+    ap.add_argument("--fill_k", type=float, default=float(os.getenv("TRABOT_FILL_K", "0.25")))
+    ap.add_argument("--bad_lines", choices=["error", "skip"], default=os.getenv("TRABOT_BAD_LINES", "skip"))
     args = ap.parse_args()
 
     if not os.path.exists(args.history):
         raise SystemExit(f"Missing: {args.history}")
 
-    df = pd.read_csv(args.history)
+    df, meta = read_csv_safe(args.history, bad_lines=args.bad_lines)
+    if meta.get("parser_mode") != "default":
+        print(f"[warn] CSV parser fallback: mode={meta.get('parser_mode')} skipped≈{meta.get('skipped_lines_est',0)} lines")
     if df.empty:
         raise SystemExit("History file empty.")
 
@@ -497,7 +593,22 @@ def main():
             out_rows.append({**r.to_dict(), "eval_status": f"OPT_FETCH_FAIL: {e}"})
             continue
 
-        ev = evaluate_path_with_mfe_mae(opt_df, ts_reco, sl, tgt)
+        spread = 0.0
+        try:
+            if str(r.get("spread_pct", "")).strip() != "":
+                spread = float(r.get("spread_pct"))
+        except Exception:
+            spread = 0.0
+
+        ev = evaluate_path_with_mfe_mae(
+            opt_df,
+            ts_reco,
+            sl,
+            tgt,
+            spread_pct=spread,
+            fill_model=args.fill_model,
+            fill_k=args.fill_k,
+        )
         if ev.get("status") != "OK":
             out_rows.append({**r.to_dict(), "eval_status": ev.get("status")})
             continue
@@ -530,9 +641,11 @@ def main():
             "eval_status": "OK",
             "entry_ts_mkt": ev["entry_ts"],
             "entry_px_mkt": ev["entry_px"],
+            "entry_px_raw": ev.get("entry_px_raw"),
             "hit": ev["hit"],
             "exit_ts": ev["exit_ts"],
             "exit_px": ev["exit_px"],
+            "exit_px_raw": ev.get("exit_px_raw"),
             "pnl": ev["pnl"],
             "pnl_pct": ev["pnl_pct"],
             "bars_to_exit": ev["bars_to_exit"],
@@ -541,6 +654,9 @@ def main():
             "mae": ev["mae"],
             "mfe_frac_to_target": ev["mfe_frac_to_target"],
             "mae_frac_to_sl": ev["mae_frac_to_sl"],
+            "fill_model": ev.get("fill_model"),
+            "fill_k": ev.get("fill_k"),
+            "spread_pct_used": ev.get("spread_pct_used"),
             "spot_move_pct_favorable": spot_move_pct_fav,
         })
         out["loss_tags"] = loss_tags(out)

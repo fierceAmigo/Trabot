@@ -22,6 +22,9 @@ Educational tool only – not financial advice.
 from __future__ import annotations
 
 import os
+import json
+import sys
+import platform
 import argparse
 import math
 import time
@@ -49,6 +52,24 @@ from market_sentiment import compute_market_context, append_market_context, Mark
 # ----------------------------
 
 DATA_DIR = os.getenv("TRABOT_DATA_DIR", "data")
+# Schema / Phase-1 instrumentation
+SCHEMA_VERSION = os.getenv("TRABOT_SCHEMA_VERSION", "v22_p1").strip()
+DEFAULT_RECO_HISTORY_PATH = os.path.join(DATA_DIR, f"reco_history_{SCHEMA_VERSION}.csv")
+RECO_HISTORY_PATH = os.getenv("TRABOT_RECO_HISTORY", DEFAULT_RECO_HISTORY_PATH)
+
+# Run manifests (phase-1)
+MANIFEST_DIR = os.getenv("TRABOT_MANIFEST_DIR", DATA_DIR)
+
+# Phase-2 gates (defaults can be mode-specific in main)
+REQUIRE_HTF_ALIGN_ENV = os.getenv("TRABOT_REQUIRE_HTF_ALIGN", "").strip()
+SKIP_CHOP_ENV = os.getenv("TRABOT_SKIP_CHOP", "").strip()
+BLOCK_LONG_PREMIUM_IVP = float(os.getenv("TRABOT_BLOCK_LONG_PREMIUM_IVP", "0.0") or 0.0)
+
+# Runtime gates (set in main)
+G_REQUIRE_HTF_ALIGN = False
+G_SKIP_CHOP = False
+G_BLOCK_LONG_PREMIUM_IVP = float(BLOCK_LONG_PREMIUM_IVP)
+
 
 INSTRUMENTS_CACHE_PATH = os.getenv("INSTRUMENTS_CACHE_PATH", os.path.join(DATA_DIR, "kite_instruments_NFO.csv"))
 CACHE_TTL_MINUTES = int(os.getenv("TRABOT_CACHE_TTL_MIN", "5"))  # you wanted max 5 mins
@@ -99,24 +120,6 @@ MIN_OI = int(os.getenv("TRABOT_MIN_OI", "20000"))
 MIN_VOL = int(os.getenv("TRABOT_MIN_VOL", "5000"))
 RISK_PER_TRADE_PCT = float(os.getenv("TRABOT_RISK_PER_TRADE_PCT", "0.015"))
 TIME_STOP_MIN = int(os.getenv("TRABOT_TIME_STOP_MIN", "90"))
-
-# --- Tradeability / stop model knobs (v2.3+) ---
-# If you keep getting "death by stop-loss", switch to premium-based stops and/or tighten regime gates.
-STOP_MODEL = os.getenv("TRABOT_STOP_MODEL", "premium").strip().lower()  # "premium" or "delta"
-BASE_SL_PCT_INTRADAY = float(os.getenv("TRABOT_BASE_SL_PCT_INTRADAY", "0.35"))
-BASE_SL_PCT_SWING = float(os.getenv("TRABOT_BASE_SL_PCT_SWING", "0.45"))
-MIN_SL_PCT = float(os.getenv("TRABOT_MIN_SL_PCT", "0.25"))   # at least this wide (25% premium)
-MAX_SL_PCT = float(os.getenv("TRABOT_MAX_SL_PCT", "0.55"))   # at most this wide (55% premium)
-TGT_TO_SL_RATIO = float(os.getenv("TRABOT_TGT_TO_SL_RATIO", "2.0"))
-STOP_SPREAD_BUFFER_FRAC = float(os.getenv("TRABOT_STOP_SPREAD_BUFFER_FRAC", "0.25"))
-
-SKIP_CHOP = os.getenv("TRABOT_SKIP_CHOP", "1").strip().lower() in ("1", "true", "yes")
-HIGH_IV_BUY_BLOCK = float(os.getenv("TRABOT_HIGH_IV_BUY_BLOCK", "0.75"))  # block BUY if iv_pct >= this
-SKIP_LONG_RISK_OFF = os.getenv("TRABOT_SKIP_LONG_RISK_OFF", "1").strip().lower() in ("1", "true", "yes")
-
-SKIP_UNSIZED = os.getenv("TRABOT_SKIP_UNSIZED", "1").strip().lower() in ("1", "true", "yes")  # drop pass_caps=False
-ALLOW_UNSIZED_FALLBACK = os.getenv("TRABOT_ALLOW_UNSIZED", "0").strip().lower() in ("1", "true", "yes")
-CURRENT_MODE = os.getenv("TRABOT_MODE", "intraday").strip().lower()
 
 # Expiry band (DTE) control (v2.2.x)
 MIN_DTE_DAYS = int(os.getenv("TRABOT_MIN_DTE_DAYS", "0"))
@@ -177,6 +180,19 @@ INDEX_SPOT_MAP = {
 
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
+
+
+def _write_json(path: str, obj: dict) -> None:
+    _ensure_dir(os.path.dirname(path) or ".")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2, sort_keys=True)
+
+
+def write_run_manifest(run_id: str, payload: dict) -> str:
+    path = os.path.join(MANIFEST_DIR, f"run_manifest_{run_id}.json")
+    _write_json(path, payload)
+    return path
+
 
 
 def _load_instruments_nfo(cache_path: str) -> pd.DataFrame:
@@ -582,13 +598,14 @@ def _build_candidate(item: dict, lot_map: dict, market_ctx: MarketContext | None
 
     regime = _classify_regime_v21(sig.metrics, pct)
 
-    # ---- Tradeability gates (reduce chop/IV stop-outs) ----
-    if SKIP_CHOP and regime == "CHOP":
+    # Phase-2 gates (keep simple; prefer skipping bad regimes over micro-filtering)
+    if G_SKIP_CHOP and str(regime).upper() == "CHOP":
         return None
-    if pct is not None and pct == pct and float(pct) >= float(HIGH_IV_BUY_BLOCK):
+    if pct is not None and G_BLOCK_LONG_PREMIUM_IVP and float(pct) >= float(G_BLOCK_LONG_PREMIUM_IVP):
         return None
-    if market_ctx is not None and getattr(market_ctx, "risk_off", False) and side == "LONG" and SKIP_LONG_RISK_OFF:
+    if G_REQUIRE_HTF_ALIGN and not htf_align:
         return None
+
 
     want_right = "CE" if side == "LONG" else "PE"
     pick = _pick_best_contract(chain, want_right=want_right)
@@ -614,46 +631,15 @@ def _build_candidate(item: dict, lot_map: dict, market_ctx: MarketContext | None
     px_for_iv = mid if mid is not None and mid > 0 else float(entry_opt)
     iv, g, greeks_conf, dte = _compute_iv_and_greeks(float(chain.spot), chain.expiry, want_right, strike, px_for_iv)
 
-    # Stop/target model
-    # - "delta" maps underlying stop/target into option premium via |delta| (often too tight intraday)
-    # - "premium" uses a premium-based stop (wider + more stable) but still respects the underlying-mapped distance
+    # Map underlying stop/target to option stop/target using delta (simple approximation)
     delta_abs = abs(float(g.get("delta", 0.5)))
     delta_abs = min(0.75, max(0.25, delta_abs))
 
     risk_u = abs(entry_u - stop_u)
     rew_u = abs(target_u - entry_u)
 
-    base_sl = BASE_SL_PCT_INTRADAY if CURRENT_MODE == "intraday" else BASE_SL_PCT_SWING
-    sl_pct = float(base_sl)
-    if pct is not None and pct == pct:
-        # widen stop a bit in high-IV regimes; tighten slightly in low-IV regimes
-        sl_pct = float(base_sl) + 0.10 * (float(pct) - 0.50)
-    sl_pct = max(MIN_SL_PCT, min(MAX_SL_PCT, sl_pct))
-
-    # Candidate stops from two perspectives
-    sl_delta = float(entry_opt) - float(delta_abs) * float(risk_u)
-    sl_prem = float(entry_opt) * (1.0 - float(sl_pct))
-
-    # Choose stop
-    sl_opt = sl_delta if STOP_MODEL == "delta" else min(sl_delta, sl_prem)
-
-    # Clamp stop within [max-loss, min-loss] bounds (in premium terms)
-    sl_lo = float(entry_opt) * (1.0 - float(MAX_SL_PCT))  # widest allowed (lowest price)
-    sl_hi = float(entry_opt) * (1.0 - float(MIN_SL_PCT))  # tightest allowed (highest price)
-    sl_opt = min(max(float(sl_opt), float(sl_lo)), float(sl_hi))
-
-    # Spread buffer so we don't get stopped purely on bid/ask noise
-    if bid is not None and ask is not None and ask > bid:
-        spr = float(ask) - float(bid)
-        sl_opt = min(float(sl_opt), float(bid) - float(STOP_SPREAD_BUFFER_FRAC) * float(spr))
-        sl_opt = max(float(sl_opt), float(sl_lo))
-
-    sl_opt = max(0.05, float(sl_opt))
-
-    # Targets (keep at least a reward multiple relative to stop distance)
-    tgt_delta = float(entry_opt) + float(delta_abs) * float(rew_u)
-    tgt_prem = float(entry_opt) * (1.0 + float(sl_pct) * float(TGT_TO_SL_RATIO))
-    tgt_opt = tgt_delta if STOP_MODEL == "delta" else max(float(tgt_delta), float(tgt_prem))
+    sl_opt = max(0.05, entry_opt - delta_abs * risk_u)
+    tgt_opt = entry_opt + delta_abs * rew_u
 
     # Score (simple + data-centric)
     adx = float(sig.metrics.get("adx", 0.0))
@@ -699,9 +685,6 @@ def _build_candidate(item: dict, lot_map: dict, market_ctx: MarketContext | None
     final_lots = int(min(int(max_lots), int(risk_lots))) if risk_lots > 0 else int(max_lots)
     pass_caps = bool(final_lots >= 1)
 
-    if SKIP_UNSIZED and not pass_caps:
-        return None
-
     # Explainability notes
     notes = []
     notes.append(f"adx={float(sig.metrics.get('adx',0.0) or 0.0):.1f}")
@@ -716,6 +699,7 @@ def _build_candidate(item: dict, lot_map: dict, market_ctx: MarketContext | None
 
     return {
         "underlying": item["underlying"],
+        "ts_signal": str(last_ts),
         "spot_symbol": item["spot"],
         "expiry": chain.expiry,
         "dte": int(dte),
@@ -732,6 +716,12 @@ def _build_candidate(item: dict, lot_map: dict, market_ctx: MarketContext | None
         "target": float(tgt_opt),
         "time_stop_min": int(TIME_STOP_MIN),
         "spread_pct": spread_pct,
+        "bid": bid,
+        "ask": ask,
+        "mid": mid,
+        "ltp": ltp,
+        "quote_ts": pick.get("quote_timestamp") or pick.get("last_trade_time") or "",
+        "entry_model": "ask" if ask is not None else ("mid" if mid is not None else "ltp"),
         "iv": float(iv),
         "iv_pct": float(pct) if pct is not None else float("nan"),
         "iv_samples": int(n),
@@ -757,12 +747,24 @@ def _build_candidate(item: dict, lot_map: dict, market_ctx: MarketContext | None
     }
 
 
-def _reco_row(c: dict, ts_str: str, run_id: str, source: str, bucket: str) -> dict:
+def _reco_row(c: dict, ts_str: str, run_id: str, source: str, bucket: str, mode: str) -> dict:
     action = "BUY_CE" if c["side"] == "LONG" else "BUY_PE"
     if not c.get("is_live", True):
         action = "WATCH_CE" if c["side"] == "LONG" else "WATCH_PE"
     return {
         "ts_reco": ts_str,
+        "schema_version": SCHEMA_VERSION,
+        "mode": mode,
+        "interval": INTERVAL,
+        "htf_interval": HTF_INTERVAL,
+        "ts_signal": c.get("ts_signal",""),
+        "quote_ts": c.get("quote_ts",""),
+        "entry_model": c.get("entry_model",""),
+        "bid": c.get("bid",""),
+        "ask": c.get("ask",""),
+        "mid": c.get("mid",""),
+        "ltp": c.get("ltp",""),
+        "spread_pct": c.get("spread_pct",""),
         "run_id": run_id,
         "source": source,
         "bucket": bucket,
@@ -830,9 +832,6 @@ def main(mode: str = "intraday"):
         mode = "intraday"
     md = MODE_DEFAULTS[mode]
 
-    global CURRENT_MODE
-    CURRENT_MODE = mode
-
     global INTERVAL, LOOKBACK_DAYS, STOP_ATR_MULT, TARGET_ATR_MULT, RISK_PER_TRADE_PCT, TIME_STOP_MIN
     global MIN_DTE_DAYS, MAX_DTE_DAYS, HTF_INTERVAL
 
@@ -898,6 +897,48 @@ def main(mode: str = "intraday"):
     print(f"Capital: ₹{TRABOT_CAPITAL:,.0f} | Risk profile: {TRABOT_RISK_PROFILE}")
     print(f"Run: {ts_str}  (run_id={run_id})\n")
 
+    # Phase-1: write a run manifest (config + environment) for reproducibility/debugging
+    require_htf_align = REQUIRE_HTF_ALIGN_ENV.lower() in ("1", "true", "yes") if REQUIRE_HTF_ALIGN_ENV else (mode == "intraday")
+    skip_chop = SKIP_CHOP_ENV.lower() in ("1", "true", "yes") if SKIP_CHOP_ENV else False
+
+    global G_REQUIRE_HTF_ALIGN, G_SKIP_CHOP, G_BLOCK_LONG_PREMIUM_IVP
+    G_REQUIRE_HTF_ALIGN = bool(require_htf_align)
+    G_SKIP_CHOP = bool(skip_chop)
+    G_BLOCK_LONG_PREMIUM_IVP = float(BLOCK_LONG_PREMIUM_IVP)
+
+    manifest = {
+        "schema_version": SCHEMA_VERSION,
+        "run_id": run_id,
+        "ts_run": ts_str,
+        "mode": mode,
+        "python": sys.version,
+        "platform": platform.platform(),
+        "config": {
+            "capital": TRABOT_CAPITAL,
+            "risk_profile": TRABOT_RISK_PROFILE,
+            "interval": INTERVAL,
+            "htf_interval": HTF_INTERVAL,
+            "lookback_days": LOOKBACK_DAYS,
+            "strikes_around_atm": STRIKES_AROUND_ATM,
+            "stop_atr_mult": STOP_ATR_MULT,
+            "target_atr_mult": TARGET_ATR_MULT,
+            "time_stop_min": TIME_STOP_MIN,
+            "min_dte_days": MIN_DTE_DAYS,
+            "max_dte_days": MAX_DTE_DAYS,
+            "min_mid_price": MIN_MID_PRICE,
+            "max_spread_pct": MAX_SPREAD_PCT,
+            "min_oi": MIN_OI,
+            "min_vol": MIN_VOL,
+            "require_htf_align": require_htf_align,
+            "skip_chop": skip_chop,
+            "block_long_premium_ivp": BLOCK_LONG_PREMIUM_IVP,
+            "sentiment_enabled": SENTIMENT_ENABLED,
+        },
+        "universe": {"start": start, "end": end, "count": len(universe), "total": total},
+        "market_ctx": (market_ctx.__dict__ if market_ctx else None),
+    }
+    manifest_path = write_run_manifest(run_id, manifest)
+
     cands = []
     for item in universe:
         try:
@@ -914,20 +955,8 @@ def main(mode: str = "intraday"):
         print("No candidates found in this slice.")
         return
 
-    # Prefer tradable first (pass_caps). By default we DO NOT fall back to unsized picks.
+    # Prefer tradable first (pass_caps); fall back to all
     tradable = [c for c in cands if c.get("pass_caps")]
-    if not tradable and not ALLOW_UNSIZED_FALLBACK:
-        print("No tradable candidates (pass_caps=True) for the current capital/risk caps.")
-        print("Try: increase TRABOT_CAPITAL (e.g., moderate=400000), scan index options, or set TRABOT_ALLOW_UNSIZED=1 (not recommended).")
-
-        # Still save the full scan results for inspection
-        os.makedirs("data", exist_ok=True)
-        df_all = pd.DataFrame(cands)
-        df_all.to_csv(f"data/options_scan_results_v22{suffix}.csv", index=False)
-        df_all.to_csv(f"data/options_scan_results_v22_{run_id}.csv", index=False)
-        print(f"\nSaved: data/options_scan_results_v22{suffix}.csv")
-        print(f"Saved: data/options_scan_results_v22_{run_id}.csv")
-        return
     if not tradable:
         tradable = cands
 
@@ -968,14 +997,14 @@ def main(mode: str = "intraday"):
     # Combined reco snapshot (top2+top10)
     reco_rows = []
     for c in top2_buy:
-        reco_rows.append(_reco_row(c, ts_str, run_id, "scan_options_v22", "TOP2_BUY"))
+        reco_rows.append(_reco_row(c, ts_str, run_id, "scan_options_v22", "TOP2_BUY", mode))
     for c in top2_sell:
-        reco_rows.append(_reco_row(c, ts_str, run_id, "scan_options_v22", "TOP2_SELL"))
+        reco_rows.append(_reco_row(c, ts_str, run_id, "scan_options_v22", "TOP2_SELL", mode))
     for c in top10:
-        reco_rows.append(_reco_row(c, ts_str, run_id, "scan_options_v22", f"TOP{TOP10}_OVERALL"))
+        reco_rows.append(_reco_row(c, ts_str, run_id, "scan_options_v22", f"TOP{TOP10}_OVERALL", mode))
 
     # Append-only history (never overwritten)
-    append_history(reco_rows, path=os.getenv("TRABOT_RECO_HISTORY", "data/reco_history.csv"))
+    append_history(reco_rows, path=RECO_HISTORY_PATH)
 
     # Latest + per-run snapshot of recommendations
     save_snapshot(reco_rows, f"data/reco_v22_{run_id}.csv")
@@ -987,7 +1016,8 @@ def main(mode: str = "intraday"):
     print(f"Saved: data/options_top10_v22_{run_id}.csv")
     print(f"Saved: data/reco_latest_v22{suffix}.csv")
     print(f"Saved: data/reco_v22_{run_id}.csv")
-    print(f"Appended: data/reco_history.csv (append-only)\n")
+    print(f"Saved: {manifest_path}")
+    print(f"Appended: {RECO_HISTORY_PATH} (append-only, schema-stable)\n")
 
     # Lookup
     if LOOKUP_SYMBOL:

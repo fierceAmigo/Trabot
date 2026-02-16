@@ -247,9 +247,11 @@ def get_kite_chain_slice(
             "volume": d.get("volume"),
             "bid": bid,
             "ask": ask,
+            "quote_timestamp": d.get("timestamp") or d.get("exchange_timestamp") or "",
+            "last_trade_time": d.get("last_trade_time") or "",
         })
 
-    extra = pd.DataFrame(rows, columns=["kite_symbol", "last_price", "oi", "volume", "bid", "ask"])
+    extra = pd.DataFrame(rows, columns=["kite_symbol", "last_price", "oi", "volume", "bid", "ask", "quote_timestamp", "last_trade_time"])
     merged = df_opt.merge(extra, on="kite_symbol", how="left")
 
     merged["last_price"] = pd.to_numeric(merged.get("last_price"), errors="coerce")
@@ -264,7 +266,7 @@ def get_kite_chain_slice(
     calls = merged[merged["instrument_type"] == "CE"].copy()
     puts = merged[merged["instrument_type"] == "PE"].copy()
 
-    keep_cols = ["strike", "tradingsymbol", "instrument_token", "last_price", "oi", "volume", "bid", "ask"]
+    keep_cols = ["strike", "tradingsymbol", "instrument_token", "last_price", "oi", "volume", "bid", "ask", "quote_timestamp", "last_trade_time"]
     calls = calls[keep_cols].sort_values("strike").reset_index(drop=True)
     puts = puts[keep_cols].sort_values("strike").reset_index(drop=True)
 
