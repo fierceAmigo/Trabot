@@ -70,8 +70,14 @@ STOP_ATR_MULT = float(os.getenv("STOP_ATR_MULT", "1.5"))
 TARGET_ATR_MULT = float(os.getenv("TARGET_ATR_MULT", "2.0"))
 
 RISK_FREE = float(os.getenv("RISK_FREE_RATE", "0.06"))
-TRABOT_CAPITAL = float(os.getenv("TRABOT_CAPITAL", "20000"))
 TRABOT_RISK_PROFILE = os.getenv("TRABOT_RISK_PROFILE", "high").strip().lower()
+
+_CAPITAL_ENV = os.getenv("TRABOT_CAPITAL", "").strip()
+if _CAPITAL_ENV:
+    TRABOT_CAPITAL = float(_CAPITAL_ENV)
+else:
+    # Default capital buckets (only used when TRABOT_CAPITAL is not set)
+    TRABOT_CAPITAL = 100000.0 if TRABOT_RISK_PROFILE == "high" else 400000.0 if TRABOT_RISK_PROFILE == "moderate" else 100000.0
 
 IV_PCTL_WINDOW_DAYS = int(os.getenv("IV_PCTL_WINDOW", "30"))
 IV_EWMA_SPAN = int(os.getenv("IV_EWMA_SPAN", "10"))
@@ -83,6 +89,7 @@ EXPIRY_PENALTY_DTE = int(os.getenv("EXPIRY_PENALTY_DTE", "3"))
 
 INDEX_SPOT_MAP = {
     "NIFTY": "NSE:NIFTY 50",
+    "NIFTYNXT50": "NSE:NIFTY NEXT 50",
     "BANKNIFTY": "NSE:NIFTY BANK",
     "FINNIFTY": "NSE:NIFTY FIN SERVICE",
     "MIDCPNIFTY": "NSE:NIFTY MID SELECT",
@@ -95,6 +102,58 @@ INDEX_SPOT_MAP = {
 
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
+
+
+def _load_instruments_nfo(cache_path: str) -> pd.DataFrame:
+    """Load NFO instruments from disk (preferred) or fetch with backoff.
+
+    Notes:
+      - Kite instruments dump is typically generated once per day.
+      - We avoid fetching on every run to reduce rate-limit errors.
+      - Set TRABOT_REFRESH_NFO_INSTRUMENTS=1 to force a refresh.
+    """
+    _ensure_dir(os.path.dirname(cache_path))
+    refresh = os.getenv("TRABOT_REFRESH_NFO_INSTRUMENTS", "0").strip().lower() in ("1", "true", "yes")
+
+    if not refresh and os.path.exists(cache_path):
+        try:
+            df = pd.read_csv(cache_path)
+            if not df.empty:
+                return df
+        except Exception:
+            pass
+
+    kite = get_kite()
+    last_err: Exception | None = None
+    for i in range(6):
+        try:
+            df = pd.DataFrame(kite.instruments("NFO"))
+            if df.empty:
+                raise RuntimeError("Kite instruments('NFO') returned empty")
+            try:
+                df.to_csv(cache_path, index=False)
+            except Exception:
+                pass
+            return df
+        except Exception as e:
+            last_err = e
+            msg = str(e).lower()
+            # kiteconnect raises NetworkException: Too many requests
+            if "too many requests" in msg or "429" in msg:
+                time.sleep(1.0 * (2 ** i))
+                continue
+            raise
+
+    # If still rate-limited, fall back to cache if available
+    if os.path.exists(cache_path):
+        try:
+            df = pd.read_csv(cache_path)
+            if not df.empty:
+                return df
+        except Exception:
+            pass
+
+    raise RuntimeError(f"Failed to fetch NFO instruments (rate limited). Last error: {last_err}")
 
 
 def build_universe_all_options() -> list[dict]:

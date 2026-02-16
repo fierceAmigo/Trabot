@@ -67,9 +67,28 @@ def _parse_kite_symbol(symbol: str) -> tuple[str, str]:
 
 
 def _load_or_fetch_instruments(exchange: str) -> pd.DataFrame:
+    """Load instruments master for an exchange with safe refresh.
+
+    We prefer disk cache because the instruments file is large and typically changes only daily.
+    Set TRABOT_REFRESH_INSTRUMENTS=1 (or TRABOT_REFRESH_NSE_INSTRUMENTS=1) to force refresh.
+    """
     os.makedirs(os.path.dirname(NSE_INSTRUMENTS_CACHE), exist_ok=True)
 
-    if os.path.exists(NSE_INSTRUMENTS_CACHE):
+    refresh = (
+        os.getenv("TRABOT_REFRESH_INSTRUMENTS", "0").strip().lower() in ("1", "true", "yes")
+        or os.getenv("TRABOT_REFRESH_NSE_INSTRUMENTS", "0").strip().lower() in ("1", "true", "yes")
+    )
+    max_age_hours = int(os.getenv("TRABOT_INSTRUMENTS_MAX_AGE_HOURS", "24"))
+
+    def _is_stale(path: str) -> bool:
+        try:
+            mtime = os.path.getmtime(path)
+            age_hours = (time.time() - mtime) / 3600.0
+            return age_hours > max_age_hours
+        except Exception:
+            return True
+
+    if (not refresh) and os.path.exists(NSE_INSTRUMENTS_CACHE) and (not _is_stale(NSE_INSTRUMENTS_CACHE)):
         try:
             df = pd.read_csv(NSE_INSTRUMENTS_CACHE)
             if not df.empty:
@@ -78,10 +97,36 @@ def _load_or_fetch_instruments(exchange: str) -> pd.DataFrame:
             pass
 
     kite = get_kite()
-    inst = kite.instruments(exchange)  # list[dict]
-    df = pd.DataFrame(inst)
-    df.to_csv(NSE_INSTRUMENTS_CACHE, index=False)
-    return df
+    last_err: Exception | None = None
+    for i in range(6):
+        try:
+            inst = kite.instruments(exchange)  # list[dict]
+            df = pd.DataFrame(inst)
+            if df.empty:
+                raise RuntimeError(f"Kite instruments('{exchange}') returned empty")
+            try:
+                df.to_csv(NSE_INSTRUMENTS_CACHE, index=False)
+            except Exception:
+                pass
+            return df
+        except Exception as e:
+            last_err = e
+            msg = str(e).lower()
+            if "too many requests" in msg or "429" in msg:
+                time.sleep(1.0 * (2 ** i))
+                continue
+            raise
+
+    # If still rate-limited, fall back to cache if present
+    if os.path.exists(NSE_INSTRUMENTS_CACHE):
+        try:
+            df = pd.read_csv(NSE_INSTRUMENTS_CACHE)
+            if not df.empty:
+                return df
+        except Exception:
+            pass
+
+    raise RuntimeError(f"Failed to fetch instruments('{exchange}') (rate limited). Last error: {last_err}")
 
 
 def _resolve_instrument_token(symbol: str) -> int:
@@ -198,32 +243,14 @@ def fetch_history_cached(
     ttl_minutes: int = DEFAULT_CACHE_TTL_MIN,
 ) -> Tuple[pd.DataFrame, str]:
     """
-    Drop-in cached variant expected by some scripts.
+    Drop-in variant expected by some scripts.
     Returns the same as fetch_history: (df, used_interval).
+
+    NOTE: Disk caching is disabled so every call fetches fresh candles.
+    A CSV copy is still written for inspection/debugging, but it is NOT used as a cache.
     """
     os.makedirs(CANDLE_CACHE_DIR, exist_ok=True)
     fp = _cache_path(symbol, interval)
-
-    if os.path.exists(fp):
-        age_sec = time.time() - os.path.getmtime(fp)
-        if age_sec <= ttl_minutes * 60:
-            try:
-                df = pd.read_csv(fp)
-                if "Datetime" in df.columns:
-                    df["Datetime"] = pd.to_datetime(df["Datetime"])
-                    df = df.set_index("Datetime")
-                else:
-                    # fallback: assume first col is datetime
-                    df.iloc[:, 0] = pd.to_datetime(df.iloc[:, 0])
-                    df = df.set_index(df.columns[0])
-
-                df.columns = [c.lower() for c in df.columns]
-                need = {"open", "high", "low", "close", "volume"}
-                if need.issubset(set(df.columns)) and not df.empty:
-                    return df[["open", "high", "low", "close", "volume"]].copy(), interval
-            except Exception:
-                # If cache is corrupted, fall through to fresh fetch
-                pass
 
     df, used_interval = fetch_history(symbol, lookback_days=lookback_days, interval=interval)
     out = df.copy()

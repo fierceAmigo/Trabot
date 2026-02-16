@@ -17,6 +17,7 @@ Educational tool only – not financial advice.
 from dataclasses import dataclass
 from typing import Optional, List
 import os
+import time
 import datetime as dt
 
 import pandas as pd
@@ -42,9 +43,17 @@ def _today_ist_date() -> dt.date:
 
 
 def _load_or_fetch_instruments(cache_path: str) -> pd.DataFrame:
+    """Load NFO instruments from cache or fetch with simple backoff.
+
+    Kite's instruments dump is typically generated once per day; fetching it too often can
+    trigger rate limits. By default we read from disk if available.
+    Set TRABOT_REFRESH_NFO_INSTRUMENTS=1 to force refresh.
+    """
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
 
-    if os.path.exists(cache_path):
+    refresh = os.getenv("TRABOT_REFRESH_NFO_INSTRUMENTS", "0").strip().lower() in ("1", "true", "yes")
+
+    if not refresh and os.path.exists(cache_path):
         try:
             df = pd.read_csv(cache_path)
             if not df.empty:
@@ -53,10 +62,35 @@ def _load_or_fetch_instruments(cache_path: str) -> pd.DataFrame:
             pass
 
     kite = get_kite()
-    inst = kite.instruments("NFO")
-    df = pd.DataFrame(inst)
-    df.to_csv(cache_path, index=False)
-    return df
+    last_err: Exception | None = None
+    for i in range(6):
+        try:
+            df = pd.DataFrame(kite.instruments("NFO"))
+            if df.empty:
+                raise RuntimeError("Kite instruments('NFO') returned empty")
+            try:
+                df.to_csv(cache_path, index=False)
+            except Exception:
+                pass
+            return df
+        except Exception as e:
+            last_err = e
+            msg = str(e).lower()
+            if "too many requests" in msg or "429" in msg:
+                time.sleep(1.0 * (2 ** i))
+                continue
+            raise
+
+    # Fallback to cache if still rate-limited
+    if os.path.exists(cache_path):
+        try:
+            df = pd.read_csv(cache_path)
+            if not df.empty:
+                return df
+        except Exception:
+            pass
+
+    raise RuntimeError(f"Failed to fetch NFO instruments (rate limited). Last error: {last_err}")
 
 
 def _pick_expiry_by_dte(df_opt: pd.DataFrame, min_dte_days: int = 0, max_dte_days: Optional[int] = None) -> Optional[dt.date]:
