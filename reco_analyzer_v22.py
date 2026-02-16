@@ -27,6 +27,8 @@ from typing import Optional, Tuple, List, Dict
 
 import pandas as pd
 
+from trabot_schema import DEFAULT_HISTORY_PATH as DEFAULT_RECO_HISTORY_PATH, RECO_SCHEMA_VERSION
+
 from kite_client import get_kite
 from iv_greeks import implied_volatility
 
@@ -35,8 +37,8 @@ IST = "Asia/Kolkata"
 DATA_DIR = os.getenv("TRABOT_DATA_DIR", "data")
 
 # Schema-stable history (prevents CSV field-count corruption)
-SCHEMA_VERSION = os.getenv("TRABOT_SCHEMA_VERSION", "v22_p1").strip()
-DEFAULT_HISTORY_PATH = os.path.join(DATA_DIR, f"reco_history_{SCHEMA_VERSION}.csv")
+SCHEMA_VERSION = RECO_SCHEMA_VERSION
+DEFAULT_HISTORY_PATH = DEFAULT_RECO_HISTORY_PATH
 HISTORY_PATH = os.getenv("TRABOT_RECO_HISTORY", DEFAULT_HISTORY_PATH)
 INSTRUMENTS_CACHE_PATH = os.getenv("INSTRUMENTS_CACHE_PATH", os.path.join(DATA_DIR, "kite_instruments_NFO.csv"))
 CACHE_DIR = os.path.join(DATA_DIR, "reco_eval_cache_v22")

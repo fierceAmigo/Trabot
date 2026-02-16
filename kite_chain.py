@@ -25,6 +25,25 @@ import pandas as pd
 from kite_client import get_kite
 
 
+def _kite_call_with_backoff(fn, *args, **kwargs):
+    """Call a Kite API function with simple retry/backoff on 429/Too many requests."""
+    last_err = None
+    for i in range(6):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last_err = e
+            msg = str(e).lower()
+            if 'too many requests' in msg or '429' in msg or 'rate limit' in msg:
+                time.sleep(0.7 * (2 ** i))
+                continue
+            if 'timeout' in msg or 'tempor' in msg or 'connection' in msg:
+                time.sleep(0.5 * (2 ** i))
+                continue
+            raise
+    raise RuntimeError(f'Kite call failed after retries: {last_err}')
+
+
 @dataclass
 class ChainSlice:
     expiry: Optional[str]
@@ -186,7 +205,7 @@ def get_kite_chain_slice(
     df_opt = df_opt[df_opt["expiry_norm"] == expiry_date].copy()
 
     # Spot from Kite
-    spot_payload = kite.ltp([kite_spot_symbol])
+    spot_payload = _kite_call_with_backoff(kite.ltp, [kite_spot_symbol])
     spot = float(spot_payload[kite_spot_symbol]["last_price"])
 
     # Infer strike step if requested
@@ -227,7 +246,7 @@ def get_kite_chain_slice(
     # Quote options (batched)
     quotes: dict = {}
     for chunk in _batch(symbols, n=150):
-        q = kite.quote(chunk) or {}
+        q = _kite_call_with_backoff(kite.quote, chunk) or {}
         quotes.update(q)
 
     rows = []

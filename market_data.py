@@ -1,10 +1,21 @@
 from __future__ import annotations
 
+"""market_data.py
+
+Kite historical candle fetch with disk cache + backoff.
+
+Phase-1 upgrade
+- Enable disk caching/TTL to reduce "Too many requests" errors.
+- Add retry/backoff around historical_data calls.
+
+This module is intentionally minimal and used by scan_options_v22.py.
+"""
+
 import datetime as dt
 import os
 import time
-from typing import Tuple, List
 from functools import lru_cache
+from typing import List, Tuple
 
 import pandas as pd
 
@@ -67,11 +78,8 @@ def _parse_kite_symbol(symbol: str) -> tuple[str, str]:
 
 
 def _load_or_fetch_instruments(exchange: str) -> pd.DataFrame:
-    """Load instruments master for an exchange with safe refresh.
+    """Load instruments master for an exchange with safe refresh/backoff."""
 
-    We prefer disk cache because the instruments file is large and typically changes only daily.
-    Set TRABOT_REFRESH_INSTRUMENTS=1 (or TRABOT_REFRESH_NSE_INSTRUMENTS=1) to force refresh.
-    """
     os.makedirs(os.path.dirname(NSE_INSTRUMENTS_CACHE), exist_ok=True)
 
     refresh = (
@@ -100,7 +108,7 @@ def _load_or_fetch_instruments(exchange: str) -> pd.DataFrame:
     last_err: Exception | None = None
     for i in range(6):
         try:
-            inst = kite.instruments(exchange)  # list[dict]
+            inst = kite.instruments(exchange)
             df = pd.DataFrame(inst)
             if df.empty:
                 raise RuntimeError(f"Kite instruments('{exchange}') returned empty")
@@ -113,7 +121,7 @@ def _load_or_fetch_instruments(exchange: str) -> pd.DataFrame:
             last_err = e
             msg = str(e).lower()
             if "too many requests" in msg or "429" in msg:
-                time.sleep(1.0 * (2 ** i))
+                time.sleep(1.0 * (2**i))
                 continue
             raise
 
@@ -130,13 +138,11 @@ def _load_or_fetch_instruments(exchange: str) -> pd.DataFrame:
 
 
 def _resolve_instrument_token(symbol: str) -> int:
-    """
-    Best path: kite.ltp often includes instrument_token.
-    Fallback: lookup in instruments master (cached).
-    """
+    """Resolve instrument token for Kite symbol like 'NSE:NIFTY 50'."""
+
     kite = get_kite()
 
-    # Try LTP first
+    # Try LTP first (often returns instrument_token)
     try:
         ltp = kite.ltp([symbol]).get(symbol) or {}
         tok = ltp.get("instrument_token")
@@ -180,14 +186,35 @@ def _fetch_historical_chunked(token: int, start: dt.datetime, end: dt.datetime, 
 
     while cur < end:
         cur_end = min(end, cur + dt.timedelta(days=max_days))
-        rows = kite.historical_data(
-            instrument_token=token,
-            from_date=cur,
-            to_date=cur_end,
-            interval=kite_interval,
-            continuous=False,
-            oi=False,
-        ) or []
+
+        rows: List[dict] = []
+        last_err: Exception | None = None
+        for i in range(6):
+            try:
+                rows = kite.historical_data(
+                    instrument_token=token,
+                    from_date=cur,
+                    to_date=cur_end,
+                    interval=kite_interval,
+                    continuous=False,
+                    oi=False,
+                ) or []
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                msg = str(e).lower()
+                if "too many requests" in msg or "429" in msg:
+                    time.sleep(0.7 * (2**i))
+                    continue
+                if "timeout" in msg or "tempor" in msg or "connection" in msg:
+                    time.sleep(0.5 * (2**i))
+                    continue
+                raise
+
+        if last_err is not None and not rows:
+            raise RuntimeError(f"Kite historical_data failed after retries: {last_err}")
+
         out.extend(rows)
         cur = cur_end + dt.timedelta(seconds=1)
 
@@ -195,13 +222,9 @@ def _fetch_historical_chunked(token: int, start: dt.datetime, end: dt.datetime, 
 
 
 def fetch_history(symbol: str, lookback_days: int = 35, interval: str = "15m") -> Tuple[pd.DataFrame, str]:
-    """
-    Fetch OHLCV from Kite historical candles for a Kite symbol like 'NSE:NIFTY 50'.
-    Returns: (df, used_interval)
-    df columns: open, high, low, close, volume with Datetime index.
-    """
-    kite_interval = _to_kite_interval(interval)
+    """Fetch OHLCV from Kite historical candles."""
 
+    kite_interval = _to_kite_interval(interval)
     token = _resolve_instrument_token(symbol)
 
     end = dt.datetime.now()
@@ -236,24 +259,62 @@ def _cache_path(symbol: str, interval: str) -> str:
     return os.path.join(CANDLE_CACHE_DIR, f"{safe}__{interval}.csv")
 
 
+def _read_cache(fp: str) -> pd.DataFrame:
+    df = pd.read_csv(fp)
+    if "Datetime" in df.columns:
+        df["Datetime"] = pd.to_datetime(df["Datetime"])
+        df = df.set_index("Datetime")
+    # Ensure standard shape
+    if "volume" not in df.columns:
+        df["volume"] = 0
+    return df[["open", "high", "low", "close", "volume"]].copy()
+
+
 def fetch_history_cached(
     symbol: str,
     lookback_days: int = 35,
     interval: str = "15m",
     ttl_minutes: int = DEFAULT_CACHE_TTL_MIN,
 ) -> Tuple[pd.DataFrame, str]:
-    """
-    Drop-in variant expected by some scripts.
-    Returns the same as fetch_history: (df, used_interval).
+    """Fetch candles with a disk cache.
 
-    NOTE: Disk caching is disabled so every call fetches fresh candles.
-    A CSV copy is still written for inspection/debugging, but it is NOT used as a cache.
+    Cache semantics:
+    - Cache key: (symbol, interval)
+    - Cache is considered valid if:
+        - mtime <= ttl_minutes, and
+        - covers at least the requested lookback window.
     """
+
     os.makedirs(CANDLE_CACHE_DIR, exist_ok=True)
     fp = _cache_path(symbol, interval)
 
+    # Try cache
+    try:
+        if os.path.exists(fp):
+            age_min = (time.time() - os.path.getmtime(fp)) / 60.0
+            if ttl_minutes is None or age_min <= float(ttl_minutes):
+                cached = _read_cache(fp)
+                if not cached.empty:
+                    end = dt.datetime.now()
+                    start_need = end - dt.timedelta(days=int(lookback_days))
+                    try:
+                        idx_min = pd.to_datetime(cached.index.min()).to_pydatetime()
+                    except Exception:
+                        idx_min = None
+                    if idx_min is None or idx_min <= start_need:
+                        return cached, interval
+    except Exception:
+        # Cache read issues should not break runtime.
+        pass
+
+    # Fetch fresh
     df, used_interval = fetch_history(symbol, lookback_days=lookback_days, interval=interval)
-    out = df.copy()
-    out.index.name = "Datetime"
-    out.to_csv(fp)
+
+    try:
+        out = df.copy()
+        out.index.name = "Datetime"
+        out.to_csv(fp)
+    except Exception:
+        pass
+
     return df, used_interval

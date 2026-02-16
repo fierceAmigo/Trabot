@@ -1,28 +1,26 @@
-"""
-journal.py
+"""journal.py
 
 Append-only recommendation history.
 
-Creates:
-- data/reco_history.csv  (append-only)
-- helper to also write per-run snapshots like data/reco_YYYYMMDD_HHMMSS.csv
-
-This is intentionally simple: CSV only, no DB.
+Phase-1 upgrade:
+- Supports stable, versioned schemas via trabot_schema.normalize_rows().
+- Default history path points to reco_history_v<schema>.csv.
 
 Educational tool only – not financial advice.
 """
 
 from __future__ import annotations
 
-import json
 import os
 from datetime import datetime
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
+from trabot_schema import DEFAULT_HISTORY_PATH, RECO_COLUMNS, normalize_rows
 
-DEFAULT_HISTORY_PATH = os.getenv("TRABOT_RECO_HISTORY", os.path.join("data", "reco_history.csv"))
+
+DEFAULT_HISTORY_PATH_ENV = os.getenv("TRABOT_RECO_HISTORY", DEFAULT_HISTORY_PATH)
 
 
 def make_run_id(ts: Optional[datetime] = None) -> str:
@@ -36,39 +34,66 @@ def _ensure_parent(path: str) -> None:
         os.makedirs(parent, exist_ok=True)
 
 
-def _normalize(v: Any) -> Any:
-    if v is None:
-        return ""
-    if isinstance(v, (list, tuple, set)):
-        return " | ".join(str(x) for x in v)
-    if isinstance(v, dict):
-        return json.dumps(v, ensure_ascii=False, sort_keys=True)
-    return v
+def append_history(
+    rows: List[Dict[str, Any]],
+    path: str = DEFAULT_HISTORY_PATH_ENV,
+    *,
+    columns: Optional[List[str]] = None,
+) -> Tuple[str, int]:
+    """Append rows into an append-only CSV.
 
+    If columns are provided, rows are normalized to that stable schema.
+    If not provided, we default to the canonical reco schema.
 
-def append_history(rows: List[Dict[str, Any]], path: str = DEFAULT_HISTORY_PATH) -> Tuple[str, int]:
-    """
-    Appends rows into an append-only CSV. If file doesn't exist, writes header once.
     Returns (path, n_rows_appended).
     """
     if not rows:
         return path, 0
 
+    cols = columns or RECO_COLUMNS
+    norm_rows = normalize_rows(rows, columns=cols)
+
     _ensure_parent(path)
-    norm_rows = [{k: _normalize(v) for k, v in r.items()} for r in rows]
 
     df_new = pd.DataFrame(norm_rows)
+    # Enforce column order (and avoid pandas auto-ordering).
+    df_new = df_new.reindex(columns=cols)
+
     write_header = not os.path.exists(path)
+
+    # If file exists but has a different header (corruption / old schema),
+    # we *do not* append into it. Instead write to a sibling file.
+    if not write_header:
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                first = f.readline().strip()  # header row
+            existing_cols = [c.strip() for c in first.split(",")]
+            if existing_cols != cols:
+                alt = path.replace(".csv", "") + f"__schema_mismatch_{make_run_id()}.csv"
+                path = alt
+                write_header = True
+        except Exception:
+            # If we can't read header, safest is to write to a new file.
+            alt = path.replace(".csv", "") + f"__unreadable_{make_run_id()}.csv"
+            path = alt
+            write_header = True
+
     df_new.to_csv(path, mode="a", index=False, header=write_header)
     return path, len(df_new)
 
 
-def save_snapshot(rows: List[Dict[str, Any]], path: str) -> str:
-    """
-    Writes a standalone snapshot CSV (overwrites that path).
-    Returns the path.
-    """
+def save_snapshot(
+    rows: List[Dict[str, Any]],
+    path: str,
+    *,
+    columns: Optional[List[str]] = None,
+) -> str:
+    """Write a standalone snapshot CSV (overwrites)."""
     _ensure_parent(path)
-    norm_rows = [{k: _normalize(v) for k, v in r.items()} for r in rows]
-    pd.DataFrame(norm_rows).to_csv(path, index=False)
+
+    cols = columns or RECO_COLUMNS
+    norm_rows = normalize_rows(rows, columns=cols)
+
+    df = pd.DataFrame(norm_rows).reindex(columns=cols)
+    df.to_csv(path, index=False)
     return path

@@ -33,6 +33,10 @@ from typing import Optional, Tuple
 
 import pandas as pd
 
+from trabot_schema import RECO_SCHEMA_VERSION, DEFAULT_HISTORY_PATH
+from run_manifest import write_manifest as write_run_manifest_v1, update_manifest as update_run_manifest_v1, env_snapshot, now_iso
+from regime import detect_regime
+
 from kite_client import get_kite
 from kite_chain import get_kite_chain_slice
 from strategy import compute_signal
@@ -53,12 +57,12 @@ from market_sentiment import compute_market_context, append_market_context, Mark
 
 DATA_DIR = os.getenv("TRABOT_DATA_DIR", "data")
 # Schema / Phase-1 instrumentation
-SCHEMA_VERSION = os.getenv("TRABOT_SCHEMA_VERSION", "v22_p1").strip()
-DEFAULT_RECO_HISTORY_PATH = os.path.join(DATA_DIR, f"reco_history_{SCHEMA_VERSION}.csv")
+SCHEMA_VERSION = RECO_SCHEMA_VERSION
+DEFAULT_RECO_HISTORY_PATH = DEFAULT_HISTORY_PATH
 RECO_HISTORY_PATH = os.getenv("TRABOT_RECO_HISTORY", DEFAULT_RECO_HISTORY_PATH)
 
 # Run manifests (phase-1)
-MANIFEST_DIR = os.getenv("TRABOT_MANIFEST_DIR", DATA_DIR)
+RUNS_DIR = os.getenv("TRABOT_RUNS_DIR", os.path.join(DATA_DIR, 'runs'))
 
 # Phase-2 gates (defaults can be mode-specific in main)
 REQUIRE_HTF_ALIGN_ENV = os.getenv("TRABOT_REQUIRE_HTF_ALIGN", "").strip()
@@ -129,6 +133,13 @@ MAX_DTE_DAYS = int(_MAX_DTE_ENV) if _MAX_DTE_ENV else None
 # HTF interval (used for alignment + sentiment trend calc)
 HTF_INTERVAL = os.getenv("TRABOT_HTF_INTERVAL", "60m")
 
+# Optional higher timeframe for alignment/regime (daily for swing etc.)
+DTF_INTERVAL = os.getenv("TRABOT_DTF_INTERVAL", "").strip()
+
+# Alignment mode: off / soft / hard (Phase-2).
+ALIGN_MODE_ENV = os.getenv("TRABOT_ALIGN_MODE", "").strip().lower()
+ALIGN_ALLOW_FLAT = os.getenv("TRABOT_ALIGN_ALLOW_FLAT", "1").strip() not in ("0","false","False")
+
 # Dual-mode defaults (intraday + swing)
 MODE_DEFAULTS = {
     "intraday": {
@@ -189,9 +200,8 @@ def _write_json(path: str, obj: dict) -> None:
 
 
 def write_run_manifest(run_id: str, payload: dict) -> str:
-    path = os.path.join(MANIFEST_DIR, f"run_manifest_{run_id}.json")
-    _write_json(path, payload)
-    return path
+    """Write per-run manifest under data/runs/<run_id>/manifest.json (Phase-1)."""
+    return write_run_manifest_v1(run_id=run_id, payload=payload, base_dir=RUNS_DIR, filename='manifest.json')
 
 
 
@@ -561,20 +571,19 @@ def _build_candidate(item: dict, lot_map: dict, market_ctx: MarketContext | None
 
     bos_tag, bos_strength = _bos_strength(df, lookback=20)
 
-    # HTF alignment (optional)
+    # Multi-timeframe candles (HTF/DTF) for regime + alignment (Phase-2)
+    df_htf = None
     try:
-        df_1h, _ = fetch_history_cached(item["spot"], lookback_days=LOOKBACK_DAYS, interval=HTF_INTERVAL)
-        sig_1h = compute_signal(
-            df=df_1h,
-            ema_fast=EMA_FAST, ema_slow=EMA_SLOW,
-            rsi_period=RSI_PERIOD, adx_period=ADX_PERIOD, adx_min=ADX_MIN,
-            atr_period=ATR_PERIOD,
-            stop_atr_mult=STOP_ATR_MULT, target_atr_mult=TARGET_ATR_MULT,
-        )
-        htf_align = (sig_1h.side == "NO_TRADE") or (sig_1h.side == side)
+        df_htf, _ = fetch_history_cached(item["spot"], lookback_days=LOOKBACK_DAYS, interval=HTF_INTERVAL)
     except Exception:
-        htf_align = True
+        df_htf = None
 
+    df_dtf = None
+    if DTF_INTERVAL:
+        try:
+            df_dtf, _ = fetch_history_cached(item["spot"], lookback_days=LOOKBACK_DAYS, interval=DTF_INTERVAL)
+        except Exception:
+            df_dtf = None
     chain = get_kite_chain_slice(
         underlying=item["underlying"],
         kite_spot_symbol=item["spot"],
@@ -596,16 +605,31 @@ def _build_candidate(item: dict, lot_map: dict, market_ctx: MarketContext | None
     _append_atm_iv_snapshot(item["underlying"], chain)
     pct, n, _ = iv_percentile(item["underlying"], window_days=IV_PCTL_WINDOW_DAYS, ewma_span=IV_EWMA_SPAN)
 
-    regime = _classify_regime_v21(sig.metrics, pct)
+    # Phase-2: candle-driven regime + confidence (TREND/CHOP/VOLATILE)
+    reg = detect_regime(df_ltf=df, df_htf=df_htf, df_dtf=df_dtf, ivp=pct)
+    regime = str(reg.label).upper()
+    regime_conf = float(reg.confidence or 0.0)
 
-    # Phase-2 gates (keep simple; prefer skipping bad regimes over micro-filtering)
-    if G_SKIP_CHOP and str(regime).upper() == "CHOP":
+    ltf_dir = (reg.details.get('ltf') or {}).get('dir', '')
+    htf_dir = (reg.details.get('htf') or {}).get('dir', '') if reg.details.get('htf') else ''
+    dtf_dir = (reg.details.get('dtf') or {}).get('dir', '') if reg.details.get('dtf') else ''
+
+    # Phase-2: alignment gate
+    align_mode = (ALIGN_MODE_ENV or ('hard' if G_REQUIRE_HTF_ALIGN else ('soft' if ALIGN_ALLOW_FLAT else 'off'))).lower()
+    if align_mode == 'off':
+        htf_align = True
+    elif align_mode == 'hard':
+        htf_align = bool(reg.details.get('align_strict'))
+    else:  # soft
+        htf_align = bool(reg.details.get('align_allow_flat'))
+
+    # Phase-2 gates
+    if G_SKIP_CHOP and regime == 'CHOP':
         return None
     if pct is not None and G_BLOCK_LONG_PREMIUM_IVP and float(pct) >= float(G_BLOCK_LONG_PREMIUM_IVP):
         return None
-    if G_REQUIRE_HTF_ALIGN and not htf_align:
+    if (G_REQUIRE_HTF_ALIGN or align_mode == 'hard') and not htf_align:
         return None
-
 
     want_right = "CE" if side == "LONG" else "PE"
     pick = _pick_best_contract(chain, want_right=want_right)
@@ -704,6 +728,11 @@ def _build_candidate(item: dict, lot_map: dict, market_ctx: MarketContext | None
         "expiry": chain.expiry,
         "dte": int(dte),
         "regime": regime,
+        "regime_conf": float(regime_conf),
+        "align_mode": align_mode,
+        "ltf_dir": ltf_dir,
+        "htf_dir": htf_dir,
+        "dtf_dir": dtf_dir,
         "side": side,
         "is_live": bool(is_live),
         "right": want_right,
@@ -748,54 +777,79 @@ def _build_candidate(item: dict, lot_map: dict, market_ctx: MarketContext | None
 
 
 def _reco_row(c: dict, ts_str: str, run_id: str, source: str, bucket: str, mode: str) -> dict:
+    """Normalize a candidate into the stable reco schema (Phase-1)."""
     action = "BUY_CE" if c["side"] == "LONG" else "BUY_PE"
     if not c.get("is_live", True):
         action = "WATCH_CE" if c["side"] == "LONG" else "WATCH_PE"
+
     return {
         "ts_reco": ts_str,
-        "schema_version": SCHEMA_VERSION,
-        "mode": mode,
-        "interval": INTERVAL,
-        "htf_interval": HTF_INTERVAL,
-        "ts_signal": c.get("ts_signal",""),
-        "quote_ts": c.get("quote_ts",""),
-        "entry_model": c.get("entry_model",""),
-        "bid": c.get("bid",""),
-        "ask": c.get("ask",""),
-        "mid": c.get("mid",""),
-        "ltp": c.get("ltp",""),
-        "spread_pct": c.get("spread_pct",""),
+        "schema_version": RECO_SCHEMA_VERSION,
         "run_id": run_id,
         "source": source,
         "bucket": bucket,
+        "mode": mode,
+
+        "interval": INTERVAL,
+        "htf_interval": HTF_INTERVAL,
+        "dtf_interval": DTF_INTERVAL or "",
+        "ts_signal": c.get("ts_signal", ""),
+
+        "quote_ts": c.get("quote_ts", ""),
+        "entry_model": c.get("entry_model", ""),
+        "bid": c.get("bid", ""),
+        "ask": c.get("ask", ""),
+        "mid": c.get("mid", ""),
+        "ltp": c.get("ltp", ""),
+        "spread_pct": c.get("spread_pct", ""),
+
+        "underlying": c.get("underlying", ""),
+        "spot_symbol": c.get("spot_symbol", ""),
+        "expiry": c.get("expiry", ""),
+        "dte": c.get("dte", ""),
+
         "action": action,
-        "underlying": c.get("underlying"),
-        "tradingsymbol": c.get("tradingsymbol"),
-        "kite_symbol": c.get("kite_symbol"),
-        "expiry": c.get("expiry"),
-        "dte": c.get("dte"),
-        "side": c.get("side"),
-        "entry": c.get("entry"),
-        "sl": c.get("sl"),
-        "target": c.get("target"),
+        "side": c.get("side", ""),
+        "tradingsymbol": c.get("tradingsymbol", ""),
+        "kite_symbol": c.get("kite_symbol", ""),
+        "strike": c.get("strike", ""),
+        "right": c.get("right", ""),
+
+        "entry": c.get("entry", ""),
+        "sl": c.get("sl", ""),
+        "target": c.get("target", ""),
         "time_stop_min": c.get("time_stop_min", TIME_STOP_MIN),
-        "score": c.get("score"),
-        "regime": c.get("regime"),
-        "iv": c.get("iv"),
-        "iv_pct": c.get("iv_pct"),
-        "greeks_conf": c.get("greeks_conf"),
-        "delta": c.get("delta"),
-        "vega_1pct": c.get("vega_1pct"),
-        "theta_day": c.get("theta_day"),
-        "lot_size": c.get("lot_size"),
-        "max_lots": c.get("max_lots"),
-        "pass_caps": c.get("pass_caps"),
-        "reason": c.get("reason"),
-        "notes": c.get("notes"),
-        "sent_mult": c.get("sent_mult"),
-        "mkt_bias": c.get("mkt_bias"),
-        "mkt_strength": c.get("mkt_strength"),
-        "mkt_risk_off": c.get("mkt_risk_off"),
+
+        "score": c.get("score", ""),
+        "regime": c.get("regime", ""),
+        "regime_conf": c.get("regime_conf", ""),
+        "align_mode": c.get("align_mode", ""),
+        "ltf_dir": c.get("ltf_dir", ""),
+        "htf_dir": c.get("htf_dir", ""),
+        "dtf_dir": c.get("dtf_dir", ""),
+        "htf_align": c.get("htf_align", ""),
+
+        "iv": c.get("iv", ""),
+        "iv_pct": c.get("iv_pct", ""),
+        "iv_samples": c.get("iv_samples", ""),
+        "greeks_conf": c.get("greeks_conf", ""),
+        "delta": c.get("delta", ""),
+        "vega_1pct": c.get("vega_1pct", ""),
+        "theta_day": c.get("theta_day", ""),
+
+        "lot_size": c.get("lot_size", ""),
+        "max_lots": c.get("max_lots", ""),
+        "pass_caps": c.get("pass_caps", ""),
+
+        "sent_mult": c.get("sent_mult", ""),
+        "mkt_bias": c.get("mkt_bias", ""),
+        "mkt_strength": c.get("mkt_strength", ""),
+        "mkt_risk_off": c.get("mkt_risk_off", ""),
+
+        "reason": c.get("reason", ""),
+        "notes": c.get("notes", ""),
+
+        # Anything else will be captured into extra_json by journal.append_history().
     }
 
 
@@ -907,17 +961,19 @@ def main(mode: str = "intraday"):
     G_BLOCK_LONG_PREMIUM_IVP = float(BLOCK_LONG_PREMIUM_IVP)
 
     manifest = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": RECO_SCHEMA_VERSION,
         "run_id": run_id,
-        "ts_run": ts_str,
+        "ts_start": ts_str,
         "mode": mode,
         "python": sys.version,
         "platform": platform.platform(),
+        "env": env_snapshot(),
         "config": {
             "capital": TRABOT_CAPITAL,
             "risk_profile": TRABOT_RISK_PROFILE,
             "interval": INTERVAL,
             "htf_interval": HTF_INTERVAL,
+            "dtf_interval": DTF_INTERVAL or "",
             "lookback_days": LOOKBACK_DAYS,
             "strikes_around_atm": STRIKES_AROUND_ATM,
             "stop_atr_mult": STOP_ATR_MULT,
@@ -929,13 +985,28 @@ def main(mode: str = "intraday"):
             "max_spread_pct": MAX_SPREAD_PCT,
             "min_oi": MIN_OI,
             "min_vol": MIN_VOL,
+            "risk_per_trade_pct": RISK_PER_TRADE_PCT,
             "require_htf_align": require_htf_align,
             "skip_chop": skip_chop,
             "block_long_premium_ivp": BLOCK_LONG_PREMIUM_IVP,
+            "align_mode_env": ALIGN_MODE_ENV,
+            "align_allow_flat": ALIGN_ALLOW_FLAT,
             "sentiment_enabled": SENTIMENT_ENABLED,
         },
-        "universe": {"start": start, "end": end, "count": len(universe), "total": total},
+        "cache": {
+            "ttl_minutes": CACHE_TTL_MINUTES,
+            "instruments_cache_path": INSTRUMENTS_CACHE_PATH,
+            "candle_cache_dir": os.getenv("TRABOT_CANDLE_CACHE_DIR", os.path.join(DATA_DIR, "candle_cache")),
+        },
+        "universe": {
+            "start": start,
+            "end": end,
+            "count": len(universe),
+            "total": total,
+            "sample_underlyings": [u.get('underlying') for u in universe[:20]],
+        },
         "market_ctx": (market_ctx.__dict__ if market_ctx else None),
+        "outputs": {},
     }
     manifest_path = write_run_manifest(run_id, manifest)
 
@@ -1009,6 +1080,41 @@ def main(mode: str = "intraday"):
     # Latest + per-run snapshot of recommendations
     save_snapshot(reco_rows, f"data/reco_v22_{run_id}.csv")
     save_snapshot(reco_rows, f"data/reco_latest_v22{suffix}.csv")
+
+    # Phase-1: update manifest with end stats, outputs, and quote timestamp range
+    try:
+        qts = [c.get("quote_ts") for c in cands if c.get("quote_ts")]
+        qt_ser = pd.to_datetime(pd.Series(qts), errors="coerce") if qts else pd.Series([], dtype="datetime64[ns]")
+        qt_min = qt_ser.min() if not qt_ser.empty else None
+        qt_max = qt_ser.max() if not qt_ser.empty else None
+
+        updates = {
+            "ts_end": now_iso(),
+            "stats": {
+                "candidates": int(len(cands)),
+                "tradable": int(len([c for c in cands if c.get("pass_caps")])),
+                "top2_buy": int(len(top2_buy)),
+                "top2_sell": int(len(top2_sell)),
+                f"top{TOP10}_overall": int(len(top10)),
+            },
+            "quote_ts": {
+                "n": int(len(qts)),
+                "min": (qt_min.isoformat() if hasattr(qt_min, "isoformat") else str(qt_min)) if qt_min is not None and str(qt_min) != "NaT" else "",
+                "max": (qt_max.isoformat() if hasattr(qt_max, "isoformat") else str(qt_max)) if qt_max is not None and str(qt_max) != "NaT" else "",
+            },
+            "outputs": {
+                "options_scan_results_latest": f"data/options_scan_results_v22{suffix}.csv",
+                "options_scan_results_run": f"data/options_scan_results_v22_{run_id}.csv",
+                "options_top10_latest": f"data/options_top10_v22{suffix}.csv",
+                "options_top10_run": f"data/options_top10_v22_{run_id}.csv",
+                "reco_latest": f"data/reco_latest_v22{suffix}.csv",
+                "reco_run": f"data/reco_v22_{run_id}.csv",
+                "reco_history": RECO_HISTORY_PATH,
+            },
+        }
+        update_run_manifest_v1(manifest_path, updates)
+    except Exception:
+        pass
 
     print(f"\nSaved: data/options_scan_results_v22{suffix}.csv")
     print(f"Saved: data/options_scan_results_v22_{run_id}.csv")

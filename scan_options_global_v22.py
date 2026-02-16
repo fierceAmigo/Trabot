@@ -16,6 +16,7 @@ Educational tool only – not financial advice.
 from __future__ import annotations
 
 import os
+import sys
 import argparse
 import time
 import math
@@ -23,6 +24,10 @@ import datetime as dt
 from functools import lru_cache
 
 import pandas as pd
+
+from trabot_schema import RECO_SCHEMA_VERSION, DEFAULT_HISTORY_PATH
+from run_manifest import write_manifest as write_run_manifest_v1, update_manifest as update_run_manifest_v1, env_snapshot, now_iso
+from regime import detect_regime
 
 from kite_client import get_kite
 from kite_chain import get_kite_chain_slice
@@ -38,13 +43,19 @@ from journal import append_history, save_snapshot, make_run_id
 DATA_DIR = os.getenv("TRABOT_DATA_DIR", "data")
 
 # Schema-stable reco history (prevents CSV field-count corruption)
-SCHEMA_VERSION = os.getenv("TRABOT_SCHEMA_VERSION", "v22_p1").strip()
-DEFAULT_RECO_HISTORY_PATH = os.path.join(DATA_DIR, f"reco_history_{SCHEMA_VERSION}.csv")
+SCHEMA_VERSION = RECO_SCHEMA_VERSION
+DEFAULT_RECO_HISTORY_PATH = DEFAULT_HISTORY_PATH
 RECO_HISTORY_PATH = os.getenv("TRABOT_RECO_HISTORY", DEFAULT_RECO_HISTORY_PATH)
 
 INSTRUMENTS_CACHE_PATH = os.getenv("INSTRUMENTS_CACHE_PATH", os.path.join(DATA_DIR, "kite_instruments_NFO.csv"))
 
 CACHE_TTL_MINUTES = int(os.getenv("TRABOT_CACHE_TTL_MIN", "5"))
+
+RUNS_DIR = os.getenv("TRABOT_RUNS_DIR", os.path.join(DATA_DIR, "runs"))
+
+# Alignment mode: off / soft / hard (Phase-2).
+ALIGN_MODE_ENV = os.getenv("TRABOT_ALIGN_MODE", "").strip().lower()
+ALIGN_ALLOW_FLAT = os.getenv("TRABOT_ALIGN_ALLOW_FLAT", "1").strip() not in ("0","false","False")
 
 LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "120"))
 INTERVAL = os.getenv("INTERVAL", "60m")  # global scan tends to do 60m
@@ -530,15 +541,29 @@ def reco_row(c: dict, ts_str: str, run_id: str, bucket: str, mode: str) -> dict:
 
     return {
         "ts_reco": ts_str,
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": RECO_SCHEMA_VERSION,
         "mode": mode,
+        "interval": INTERVAL,
+        "htf_interval": "day",
+        "dtf_interval": "",
         "run_id": run_id,
         "source": "scan_global_v22",
         "bucket": bucket,
+        "ts_signal": c.get("ts_signal", ""),
+        "quote_ts": c.get("quote_ts", ""),
+        "entry_model": c.get("entry_model", "mid"),
+        "bid": c.get("bid", ""),
+        "ask": c.get("ask", ""),
+        "mid": c.get("mid", ""),
+        "ltp": c.get("ltp", ""),
+        "spread_pct": c.get("spread_pct", ""),
         "action": action,
         "underlying": c.get("underlying"),
+        "spot_symbol": c.get("spot_symbol"),
         "tradingsymbol": c.get("tradingsymbol"),
         "kite_symbol": c.get("kite_symbol"),
+        "strike": c.get("strike"),
+        "right": c.get("right"),
         "expiry": c.get("expiry"),
         "dte": c.get("dte"),
         "side": c.get("side"),
@@ -555,6 +580,11 @@ def reco_row(c: dict, ts_str: str, run_id: str, bucket: str, mode: str) -> dict:
         "move_atr_ratio": c.get("move_atr_ratio"),
         "high_iv_block": c.get("high_iv_block"),
         "regime": c.get("regime"),
+        "regime_conf": c.get("regime_conf"),
+        "align_mode": c.get("align_mode"),
+        "ltf_dir": c.get("ltf_dir"),
+        "htf_dir": c.get("htf_dir"),
+        "dtf_dir": c.get("dtf_dir"),
         "iv": c.get("iv"),
         "iv_pct": c.get("iv_pct"),
         "greeks_conf": c.get("greeks_conf"),
@@ -607,6 +637,38 @@ def main(mode: str = "intraday"):
     print(f"Capital: ₹{TRABOT_CAPITAL:,.0f} | risk={TRABOT_RISK_PROFILE} | TTL={CACHE_TTL_MINUTES} min")
     print(f"Run: {ts_str} (run_id={run_id})\n")
 
+    # Phase-1: per-run manifest for reproducibility/debugging
+    manifest = {
+        "schema_version": RECO_SCHEMA_VERSION,
+        "run_id": run_id,
+        "ts_start": ts_str,
+        "mode": mode,
+        "python": sys.version if "sys" in globals() else "",
+        "env": env_snapshot(),
+        "config": {
+            "capital": TRABOT_CAPITAL,
+            "risk_profile": TRABOT_RISK_PROFILE,
+            "interval": interval,
+            "htf_interval": "day",
+            "lookback_days": LOOKBACK_DAYS,
+            "strikes_around_atm": STRIKES_AROUND_ATM,
+            "min_dte_days": min_dte_days,
+            "max_dte_days": max_dte_days,
+            "align_mode_env": ALIGN_MODE_ENV,
+            "align_allow_flat": ALIGN_ALLOW_FLAT,
+        },
+        "cache": {
+            "ttl_minutes": CACHE_TTL_MINUTES,
+            "instruments_cache_path": INSTRUMENTS_CACHE_PATH,
+        },
+        "universe": {
+            "count": len(universe),
+            "sample_underlyings": [u.get("underlying") for u in universe[:20]],
+        },
+        "outputs": {},
+    }
+    manifest_path = write_run_manifest_v1(run_id=run_id, payload=manifest, base_dir=RUNS_DIR, filename="manifest_global.json")
+
     cands = []
     for item in universe:
         try:
@@ -646,20 +708,12 @@ def main(mode: str = "intraday"):
 
             bos_tag, bos_strength = _bos_strength(df, 20)
 
-            # quick HTF align with 1D (since this is global scan)
+            # Multi-timeframe candles for regime + alignment (Phase-2)
+            df_htf = None
             try:
                 df_htf, _ = fetch_history_cached(item["spot"], lookback_days=LOOKBACK_DAYS, interval="day")
-                sig_htf = compute_signal(
-                    df=df_htf,
-                    ema_fast=EMA_FAST, ema_slow=EMA_SLOW,
-                    rsi_period=RSI_PERIOD, adx_period=ADX_PERIOD, adx_min=ADX_MIN,
-                    atr_period=ATR_PERIOD,
-                    stop_atr_mult=1.5, target_atr_mult=2.2,
-                )
-                htf_align = (sig_htf.side == "NO_TRADE") or (sig_htf.side == side)
             except Exception:
-                htf_align = True
-
+                df_htf = None
             atr_u = _get_atr(sig.metrics, df)
             move_u = abs(target_u - entry_u)
             move_atr_ratio = (move_u / atr_u) if atr_u > 1e-9 else 0.0
@@ -691,7 +745,28 @@ def main(mode: str = "intraday"):
                 })
             pct, n, _ = iv_percentile(item["underlying"], window_days=IV_PCTL_WINDOW_DAYS, ewma_span=IV_EWMA_SPAN)
 
-            regime = "VOLATILE" if (pct is not None and pct >= HIGH_IV_PCTL) else ("TREND" if float(sig.metrics.get("adx", 0)) >= ADX_GATE else "CHOP")
+            # Phase-2: candle-driven regime + confidence (TREND/CHOP/VOLATILE)
+            reg = detect_regime(df_ltf=df, df_htf=df_htf, ivp=pct)
+            regime = str(reg.label).upper()
+            regime_conf = float(reg.confidence or 0.0)
+
+            ltf_dir = (reg.details.get("ltf") or {}).get("dir", "")
+            htf_dir = (reg.details.get("htf") or {}).get("dir", "") if reg.details.get("htf") else ""
+
+            align_mode = (ALIGN_MODE_ENV or "hard").lower()
+            if align_mode == "off":
+                htf_align = True
+            elif align_mode == "hard":
+                htf_align = bool(reg.details.get("align_strict"))
+            else:
+                htf_align = bool(reg.details.get("align_allow_flat"))
+
+            # Hard alignment gate (Phase-2). Only enforce if HTF direction exists.
+            if align_mode == "hard" and htf_dir and not htf_align:
+                continue
+
+            # Keep legacy high-IV block logic for now (phase-3 will replace)
+            high_iv_block = bool(pct is not None and pct >= HIGH_IV_PCTL and float(sig.metrics.get("adx", 0.0)) < HIGH_IV_ADX and float(bos_strength) < HIGH_IV_BOS)
 
             conf_score = directional_confidence(side, sig.metrics, bos_tag, float(bos_strength), bool(htf_align))
 
@@ -779,6 +854,11 @@ def main(mode: str = "intraday"):
                 "expiry": chain.expiry,
                 "dte": int(dte),
                 "regime": regime,
+                "regime_conf": float(regime_conf),
+                "align_mode": align_mode,
+                "ltf_dir": ltf_dir,
+                "htf_dir": htf_dir,
+                "dtf_dir": "",
                 "side": side,
                 "is_live": bool(is_live),
                 "trade_ok": bool(trade_ok),
@@ -794,8 +874,14 @@ def main(mode: str = "intraday"):
                 "notes": notes_str,
 
                 "tradingsymbol": tsym,
+                "quote_ts": pick.get("quote_timestamp") or pick.get("last_trade_time") or "",
+                "bid": float(pick.get("bid", 0.0)) if pick.get("bid") == pick.get("bid") else float("nan"),
+                "ask": float(pick.get("ask", 0.0)) if pick.get("ask") == pick.get("ask") else float("nan"),
+                "mid": float(pick.get("mid", 0.0)) if pick.get("mid") == pick.get("mid") else float("nan"),
+                "ltp": float(pick.get("last_price", 0.0)) if pick.get("last_price") == pick.get("last_price") else float("nan"),
                 "kite_symbol": f"NFO:{tsym}",
                 "strike": int(strike),
+                "right": want_right,
 
                 "entry": float(entry_opt),
                 "sl": float("nan"),
@@ -905,6 +991,34 @@ def main(mode: str = "intraday"):
     append_history(reco_rows, path=RECO_HISTORY_PATH)
     save_snapshot(reco_rows, os.path.join(DATA_DIR, f"reco_latest_global_v22{suffix}.csv"))
     save_snapshot(reco_rows, os.path.join(DATA_DIR, f"reco_global_v22{suffix}_{run_id}.csv"))
+
+    # Phase-1: update manifest with end stats, outputs, and quote timestamp range
+    try:
+        qts = [c.get("quote_ts") for c in ranked if c.get("quote_ts")]
+        qt_ser = pd.to_datetime(pd.Series(qts), errors="coerce") if qts else pd.Series([], dtype="datetime64[ns]")
+        qt_min = qt_ser.min() if not qt_ser.empty else None
+        qt_max = qt_ser.max() if not qt_ser.empty else None
+        updates = {
+            "ts_end": now_iso(),
+            "stats": {"candidates": int(len(cands)), "ranked": int(len(ranked)), "top10": int(len(top10))},
+            "quote_ts": {
+                "n": int(len(qts)),
+                "min": (qt_min.isoformat() if hasattr(qt_min, "isoformat") else str(qt_min)) if qt_min is not None and str(qt_min) != "NaT" else "",
+                "max": (qt_max.isoformat() if hasattr(qt_max, "isoformat") else str(qt_max)) if qt_max is not None and str(qt_max) != "NaT" else "",
+            },
+            "outputs": {
+                "scan_results_latest": os.path.join(DATA_DIR, f"options_scan_global_v22_results{suffix}.csv"),
+                "scan_results_run": os.path.join(DATA_DIR, f"options_scan_global_v22_results{suffix}_{run_id}.csv"),
+                "top10_latest": os.path.join(DATA_DIR, f"options_global_top10_v22{suffix}.csv"),
+                "top10_run": os.path.join(DATA_DIR, f"options_global_top10_v22{suffix}_{run_id}.csv"),
+                "reco_latest": os.path.join(DATA_DIR, f"reco_latest_global_v22{suffix}.csv"),
+                "reco_run": os.path.join(DATA_DIR, f"reco_global_v22{suffix}_{run_id}.csv"),
+                "reco_history": RECO_HISTORY_PATH,
+            },
+        }
+        update_run_manifest_v1(manifest_path, updates)
+    except Exception:
+        pass
 
     print(f"\nSaved: {os.path.join(DATA_DIR, 'options_scan_global_v22_results{suffix}.csv')}")
     print(f"Saved: {os.path.join(DATA_DIR, 'options_global_top10_v22{suffix}.csv')}")
