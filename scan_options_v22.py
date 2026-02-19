@@ -36,6 +36,8 @@ import pandas as pd
 from trabot_schema import RECO_SCHEMA_VERSION, DEFAULT_HISTORY_PATH
 from run_manifest import write_manifest as write_run_manifest_v1, update_manifest as update_run_manifest_v1, env_snapshot, now_iso
 from regime import detect_regime
+from strategy_engine import decide_blueprint, Blueprint, LegSpec
+from portfolio import load_portfolio, save_portfolio, load_clusters, make_position_from_reco, check_portfolio_caps, maybe_reserve_position
 
 from kite_client import get_kite
 from kite_chain import get_kite_chain_slice
@@ -77,6 +79,25 @@ G_BLOCK_LONG_PREMIUM_IVP = float(BLOCK_LONG_PREMIUM_IVP)
 
 INSTRUMENTS_CACHE_PATH = os.getenv("INSTRUMENTS_CACHE_PATH", os.path.join(DATA_DIR, "kite_instruments_NFO.csv"))
 CACHE_TTL_MINUTES = int(os.getenv("TRABOT_CACHE_TTL_MIN", "5"))  # you wanted max 5 mins
+TRABOT_MAX_TARGET_MOVE_PCT = float(os.getenv("TRABOT_MAX_TARGET_MOVE_PCT", "0.08"))  # intraday sanity cap
+TRABOT_MAX_STOP_MOVE_PCT = float(os.getenv("TRABOT_MAX_STOP_MOVE_PCT", "0.04"))
+TRABOT_TGT_CAP_MULT = float(os.getenv("TRABOT_TGT_CAP_MULT", "3.0"))
+TRABOT_SINGLE_LEG_SL_TGT_MODE = os.getenv("TRABOT_SINGLE_LEG_SL_TGT_MODE", "premium").strip().lower()  # premium|delta
+TRABOT_PORTFOLIO_ENABLE = os.getenv("TRABOT_PORTFOLIO_ENABLE", "0").strip() == "1"
+TRABOT_PORTFOLIO_RESERVE = os.getenv("TRABOT_PORTFOLIO_RESERVE", "0").strip() == "1"
+TRABOT_PORTFOLIO_STATE_PATH = os.getenv("TRABOT_PORTFOLIO_STATE_PATH", "data/portfolio_state.json")
+TRABOT_PORTFOLIO_MAX_PREMIUM_FRAC = float(os.getenv("TRABOT_PORTFOLIO_MAX_PREMIUM_FRAC", "0.35"))
+TRABOT_PORTFOLIO_MAX_DELTA_NOTIONAL_FRAC = float(os.getenv("TRABOT_PORTFOLIO_MAX_DELTA_NOTIONAL_FRAC", "0.60"))
+TRABOT_PORTFOLIO_MAX_VEGA_FRAC = float(os.getenv("TRABOT_PORTFOLIO_MAX_VEGA_FRAC", "0.60"))
+TRABOT_PORTFOLIO_MAX_GAMMA_FRAC = float(os.getenv("TRABOT_PORTFOLIO_MAX_GAMMA_FRAC", "0.50"))
+TRABOT_PORTFOLIO_MAX_THETA_FRAC = float(os.getenv("TRABOT_PORTFOLIO_MAX_THETA_FRAC", "0.80"))
+TRABOT_PORTFOLIO_MAX_POS_PER_UNDERLYING = int(os.getenv("TRABOT_PORTFOLIO_MAX_POS_PER_UNDERLYING", "2"))
+TRABOT_PORTFOLIO_MAX_POS_PER_CLUSTER = int(os.getenv("TRABOT_PORTFOLIO_MAX_POS_PER_CLUSTER", "4"))
+TRABOT_DEDUP_COOLDOWN_MIN = int(os.getenv("TRABOT_DEDUP_COOLDOWN_MIN", "30"))
+TRABOT_WIDTH_MAX_MOVE_PCT = float(os.getenv("TRABOT_WIDTH_MAX_MOVE_PCT", "0.03"))
+
+
+
 
 LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "180"))
 INTERVAL = os.getenv("INTERVAL", "day")  # "day" or "60m" etc.
@@ -469,6 +490,315 @@ def _pick_best_contract(chain, want_right: str) -> dict | None:
         return None
     return scored.sort_values("strike_score", ascending=False).iloc[0].to_dict()
 
+# ----------------------------
+# Phase-3: multi-leg planning
+# ----------------------------
+
+def _expected_width(entry_u: float, target_u: float, step: int, metrics: dict | None = None) -> int:
+    """Choose a reasonable structure width in strike points.
+
+    Caps target-based width (target_u can be noisy).
+    Uses ATR (if present in metrics) as a floor for expected move.
+    """
+    try:
+        entry_u = float(entry_u)
+        target_u = float(target_u)
+    except Exception:
+        return int(step * 4)
+
+    move = abs(target_u - entry_u)
+    cap_move = max(float(step) * 2.0, abs(entry_u) * float(TRABOT_WIDTH_MAX_MOVE_PCT))
+
+    try:
+        if metrics:
+            atr = metrics.get("atr") if metrics.get("atr") is not None else metrics.get("atr14")
+            if atr is not None:
+                cap_move = max(cap_move, float(atr) * 1.5)
+    except Exception:
+        pass
+
+    move = min(move, cap_move)
+    steps = int(max(2, round(move / float(step))))
+    steps = min(12, steps)
+    return int(steps * int(step))
+
+
+def _json_default(o):
+    """Best-effort JSON serializer for pandas/numpy/datetime objects."""
+    try:
+        iso = getattr(o, "isoformat", None)
+        if callable(iso):
+            return iso()
+    except Exception:
+        pass
+    try:
+        return str(o)
+    except Exception:
+        return None
+
+
+def _parse_ts_ist(x):
+    try:
+        if x is None:
+            return None
+        s = str(x).strip()
+        if not s or s.lower() in ("nan","none","null"):
+            return None
+        import pandas as pd
+        ts = pd.to_datetime(s, errors="coerce")
+        if ts is pd.NaT:
+            return None
+        if ts.tzinfo is None:
+            try:
+                ts = ts.tz_localize("Asia/Kolkata")
+            except Exception:
+                ts = ts.tz_localize("UTC").tz_convert("Asia/Kolkata")
+        else:
+            ts = ts.tz_convert("Asia/Kolkata")
+        return ts
+    except Exception:
+        return None
+
+def _lookup_leg_contract(chain, right: str, strike: int) -> dict | None:
+    """Lookup a specific strike on calls/puts and enforce the same liquidity gates used by _pick_best_contract.
+
+    Returns an enriched row dict containing bid_num/ask_num/mid/spread_pct/oi_num/vol_num.
+    """
+    right = (right or "").upper()
+    df_side = chain.calls if right == "CE" else chain.puts
+    if df_side is None or df_side.empty:
+        return None
+
+    scored = _score_strike_rows(df_side, atm=int(chain.atm))
+    if scored.empty:
+        return None
+
+    scored["strike_int"] = pd.to_numeric(scored["strike"], errors="coerce").astype("Int64")
+    scored = scored.dropna(subset=["strike_int"])
+    if scored.empty:
+        return None
+
+    # Find nearest strike if exact not found
+    scored["dist"] = (scored["strike_int"].astype(int) - int(strike)).abs()
+    row = scored.sort_values("dist").iloc[0].to_dict()
+
+    # Liquidity gates
+    try:
+        mid = float(row.get("mid"))
+    except Exception:
+        mid = float("nan")
+
+    try:
+        spr = float(row.get("spread_pct"))
+    except Exception:
+        spr = float("nan")
+
+    try:
+        oi = float(row.get("oi_num"))
+    except Exception:
+        oi = float("nan")
+
+    try:
+        vol = float(row.get("vol_num"))
+    except Exception:
+        vol = float("nan")
+
+    if not (mid == mid) or mid < MIN_MID_PRICE:
+        return None
+    if (spr == spr) and spr > MAX_SPREAD_PCT:
+        return None
+    if not (oi == oi) or oi < MIN_OI:
+        return None
+    if not (vol == vol) or vol < MIN_VOL:
+        return None
+
+    return row
+
+
+def _leg_price_used(leg_side: str, row: dict) -> float | None:
+    """BUY uses ask (fallback mid/ltp). SELL uses bid (fallback mid/ltp)."""
+    bid = row.get("bid_num")
+    ask = row.get("ask_num")
+    mid = row.get("mid")
+    ltp = row.get("last_price")
+
+    def _f(x):
+        try:
+            x = float(x)
+            return x if x == x and x > 0 else None
+        except Exception:
+            return None
+
+    bid = _f(bid)
+    ask = _f(ask)
+    mid = _f(mid)
+    ltp = _f(ltp)
+
+    if (leg_side or "").upper() == "SELL":
+        return bid or mid or ltp
+    return ask or mid or ltp
+
+
+def _compute_plan_risk(action: str, legs: list[dict], step: int) -> tuple[float | None, float | None, float | None, str]:
+    """Return (net_premium, max_loss, max_profit, breakevens_str).
+
+    net_premium: +debit, -credit (per contract)
+    max_loss/max_profit: per contract (not multiplied by lot_size)
+    """
+    act = (action or "").upper()
+    if not legs:
+        return None, None, None, ""
+
+    # net premium (+debit, -credit)
+    net = 0.0
+    for lg in legs:
+        px = lg.get("price_used")
+        if px is None:
+            return None, None, None, ""
+        px = float(px)
+        if lg.get("side") == "BUY":
+            net += px
+        else:
+            net -= px
+
+    max_loss = None
+    max_profit = None
+    be = ""
+
+    def _strike(lg, right):
+        return int(lg.get("strike")) if lg.get("right") == right else None
+
+    if act in ("BUY_CE", "BUY_PE"):
+        max_loss = net
+
+    elif act == "BULL_CALL_SPREAD":
+        # BUY CE at lower, SELL CE at higher
+        buy_k = min([int(l["strike"]) for l in legs if l["right"] == "CE" and l["side"] == "BUY"] + [0])
+        sell_k = max([int(l["strike"]) for l in legs if l["right"] == "CE" and l["side"] == "SELL"] + [buy_k])
+        width = max(0, sell_k - buy_k)
+        max_loss = net
+        max_profit = float(width) - float(net)
+        be = f"{buy_k + float(net):.2f}"
+
+    elif act == "BEAR_PUT_SPREAD":
+        buy_k = max([int(l["strike"]) for l in legs if l["right"] == "PE" and l["side"] == "BUY"] + [0])
+        sell_k = min([int(l["strike"]) for l in legs if l["right"] == "PE" and l["side"] == "SELL"] + [buy_k])
+        width = max(0, buy_k - sell_k)
+        max_loss = net
+        max_profit = float(width) - float(net)
+        be = f"{buy_k - float(net):.2f}"
+
+    elif act == "BULL_PUT_CREDIT":
+        # SELL higher put, BUY lower put
+        short_k = max([int(l["strike"]) for l in legs if l["right"] == "PE" and l["side"] == "SELL"] + [0])
+        hedge_k = min([int(l["strike"]) for l in legs if l["right"] == "PE" and l["side"] == "BUY"] + [short_k])
+        width = max(0, short_k - hedge_k)
+        credit = -float(net)
+        max_profit = credit
+        max_loss = float(width) - credit
+        be = f"{short_k - credit:.2f}"
+
+    elif act == "BEAR_CALL_CREDIT":
+        short_k = min([int(l["strike"]) for l in legs if l["right"] == "CE" and l["side"] == "SELL"] + [0])
+        hedge_k = max([int(l["strike"]) for l in legs if l["right"] == "CE" and l["side"] == "BUY"] + [short_k])
+        width = max(0, hedge_k - short_k)
+        credit = -float(net)
+        max_profit = credit
+        max_loss = float(width) - credit
+        be = f"{short_k + credit:.2f}"
+
+    elif act == "IRON_CONDOR":
+        sp = [l for l in legs if l.get("right") == "PE"]
+        sc = [l for l in legs if l.get("right") == "CE"]
+        short_put = max([int(l["strike"]) for l in sp if l["side"] == "SELL"] + [0])
+        hedge_put = min([int(l["strike"]) for l in sp if l["side"] == "BUY"] + [short_put])
+        short_call = min([int(l["strike"]) for l in sc if l["side"] == "SELL"] + [0])
+        hedge_call = max([int(l["strike"]) for l in sc if l["side"] == "BUY"] + [short_call])
+        w_put = max(0, short_put - hedge_put)
+        w_call = max(0, hedge_call - short_call)
+        width = float(max(w_put, w_call))
+        credit = -float(net)
+        max_profit = credit
+        max_loss = width - credit
+        be_low = short_put - credit
+        be_high = short_call + credit
+        be = f"{be_low:.2f}..{be_high:.2f}"
+
+    elif act in ("LONG_STRADDLE", "LONG_STRANGLE"):
+        max_loss = net
+        # Breakevens: need call strike and put strike
+        call_k = min([int(l["strike"]) for l in legs if l.get("right") == "CE"] + [0])
+        put_k = max([int(l["strike"]) for l in legs if l.get("right") == "PE"] + [0])
+        be_low = put_k - float(net)
+        be_high = call_k + float(net)
+        be = f"{be_low:.2f}..{be_high:.2f}"
+
+    return float(net), (float(max_loss) if max_loss is not None else None), (float(max_profit) if max_profit is not None else None), be
+
+
+def _plan_stop_target(action: str, entry_opt: float, net_premium: float | None, max_loss: float | None, max_profit: float | None) -> tuple[float, float]:
+    """Return (sl_opt, tgt_opt) in *strategy value space*.
+
+    We treat the 'position value' as the synthetic net premium series:
+      value(t) = sum(+BUY price - SELL price)
+    So:
+      - Debit structures start positive (entry > 0)
+      - Credit structures start negative (entry < 0)
+
+    Stop/target are therefore thresholds on that value series.
+    """
+    act = (action or "").upper()
+    entry_v = float(net_premium) if net_premium is not None else float(entry_opt)
+
+    # Default: 50% stop, 80% target for debit; for credit: 2x credit stop, 50% credit target.
+    if act in ("BUY_CE","BUY_PE","WATCH_CE","WATCH_PE","BULL_CALL_SPREAD","BEAR_PUT_SPREAD","LONG_STRADDLE","LONG_STRANGLE"):
+        # Debit
+        sl = entry_v * 0.50
+        tgt = entry_v * 1.80
+        if max_profit is not None and max_profit > 0 and act in ("BULL_CALL_SPREAD","BEAR_PUT_SPREAD"):
+            tgt = entry_v + 0.80 * float(max_profit)
+        return (max(0.01, sl), max(0.02, tgt))
+
+    if act in ("BULL_PUT_CREDIT","BEAR_CALL_CREDIT","IRON_CONDOR"):
+        # Credit (entry_v is negative). Profit target = close at 50% of credit (i.e., value goes from -C toward -0.5C)
+        credit = -entry_v
+        if credit <= 0:
+            # fallback
+            sl = entry_v * 1.50
+            tgt = entry_v * 0.50
+            return (sl, tgt)
+        tgt = -0.50 * credit
+        # Stop: close at 2x credit (more negative)
+        sl = -2.00 * credit
+        # Bound by max_loss when known
+        if max_loss is not None and max_loss > 0:
+            sl = max(sl, -float(max_loss))
+        return (sl, tgt)
+
+    # Unknown: keep old behavior
+    return (entry_v * 0.50, entry_v * 1.80)
+
+
+def _anchor_leg_index(blueprint: Blueprint, legs: list[dict]) -> int:
+    # Prefer tag match
+    tag = (blueprint.anchor_tag or "").strip()
+    if tag:
+        for i, lg in enumerate(legs):
+            if str(lg.get("tag", "")) == tag:
+                return i
+    # Prefer first BUY
+    for i, lg in enumerate(legs):
+        if lg.get("side") == "BUY":
+            return i
+    return 0
+    if TRABOT_PORTFOLIO_ENABLE and TRABOT_PORTFOLIO_RESERVE:
+        try:
+            save_portfolio(PORTFOLIO_STATE, TRABOT_PORTFOLIO_STATE_PATH)
+        except Exception:
+            pass
+
+
+
 
 def _compute_iv_and_greeks(spot: float, expiry: str, right: str, strike: int, price: float):
     T = time_to_expiry_years(expiry)
@@ -531,6 +861,13 @@ def _append_atm_iv_snapshot(underlying: str, chain) -> tuple[float | None, str]:
 
 
 def _build_candidate(item: dict, lot_map: dict, market_ctx: MarketContext | None = None) -> dict | None:
+    global SEEN_SIGNATURES, COOLDOWN_LAST_TS
+    # reco timestamp (per-candidate)
+    try:
+        ts_reco = pd.Timestamp.now(tz="Asia/Kolkata").isoformat()
+    except Exception:
+        ts_reco = str(pd.Timestamp.utcnow().isoformat())
+
     df, used_interval = fetch_history_cached(item["spot"], lookback_days=LOOKBACK_DAYS, interval=INTERVAL)
     if df.empty:
         return None
@@ -631,40 +968,198 @@ def _build_candidate(item: dict, lot_map: dict, market_ctx: MarketContext | None
     if (G_REQUIRE_HTF_ALIGN or align_mode == 'hard') and not htf_align:
         return None
 
-    want_right = "CE" if side == "LONG" else "PE"
-    pick = _pick_best_contract(chain, want_right=want_right)
-    if not pick:
-        return None
+    # ----------------------------
+    # Phase-3: strategy blueprint -> legs -> anchor
+    # ----------------------------
+    # Determine strike grid
+    strikes_all = sorted(pd.concat([chain.calls.get("strike", pd.Series(dtype=float)),
+                                    chain.puts.get("strike", pd.Series(dtype=float))], axis=0)
+                         .dropna().astype(int).unique().tolist())
+    step = int(pd.Series(strikes_all).diff().median()) if len(strikes_all) >= 3 else 50
+    if step <= 0:
+        step = 50
+    atm = int(chain.atm)
 
-    strike = int(pick["strike"])
-    tsym = str(pick["tradingsymbol"])
+    # Signal-strength used by Phase-3 selection (abs score proxy without option-specific adjustments)
+    adx = float(sig.metrics.get("adx", 0.0))
+    strength_raw = (0.8 + 0.02 * adx) * sess_factor
+    if is_live:
+        strength_raw += 0.3
+
+    width = _expected_width(entry_u, target_u, step, metrics=sig.metrics)
+
+    bp = decide_blueprint(
+        side=side,
+        regime=regime,
+        ivp=pct,
+        signal_strength=float(strength_raw),
+        atm=atm,
+        step=step,
+        width=width,
+        is_live=bool(is_live),
+        allow_neutral=True,
+    )
+
+    # Build legs with liquidity validation; if any leg fails, fall back to single-leg pick
+    legs: list[dict] = []
+    plan_action = str(bp.action)
+    plan_notes = str(bp.notes or "")
+    plan_ok = True
+
+    for spec in bp.legs:
+        row = _lookup_leg_contract(chain, spec.right, spec.strike)
+        if row is None:
+            plan_ok = False
+            break
+        price_used = _leg_price_used(spec.side, row)
+        if price_used is None or float(price_used) <= 0:
+            plan_ok = False
+            break
+
+        legs.append({
+            "side": spec.side,
+            "right": spec.right,
+            "strike": int(row.get("strike")),
+            "tradingsymbol": str(row.get("tradingsymbol") or ""),
+            "instrument_token": int(row.get("instrument_token")) if row.get("instrument_token") else None,
+            "bid": float(row.get("bid_num")) if row.get("bid_num") == row.get("bid_num") else None,
+            "ask": float(row.get("ask_num")) if row.get("ask_num") == row.get("ask_num") else None,
+            "mid": float(row.get("mid")) if row.get("mid") == row.get("mid") else None,
+            "ltp": float(row.get("last_price")) if row.get("last_price") == row.get("last_price") else None,
+            "oi": float(row.get("oi_num")) if row.get("oi_num") == row.get("oi_num") else None,
+            "volume": float(row.get("vol_num")) if row.get("vol_num") == row.get("vol_num") else None,
+            "spread_pct": float(row.get("spread_pct")) if row.get("spread_pct") == row.get("spread_pct") else None,
+            "quote_ts": _json_default(row.get("quote_timestamp") or row.get("last_trade_time") or ""),
+            "price_used": float(price_used),
+            "tag": spec.tag,
+        })
+
+    if not plan_ok or not legs:
+        # Fallback: single-leg using existing best-pick logic
+        want_right = "CE" if side == "LONG" else "PE"
+        pick = _pick_best_contract(chain, want_right=want_right)
+        if not pick:
+            return None
+
+        legs = [{
+            "side": "BUY",
+            "right": want_right,
+            "strike": int(pick["strike"]),
+            "tradingsymbol": str(pick["tradingsymbol"]),
+            "instrument_token": int(pick.get("instrument_token")) if pick.get("instrument_token") else None,
+            "bid": float(pick.get("bid_num")) if pick.get("bid_num") == pick.get("bid_num") else None,
+            "ask": float(pick.get("ask_num")) if pick.get("ask_num") == pick.get("ask_num") else None,
+            "mid": float(pick.get("mid")) if pick.get("mid") == pick.get("mid") else None,
+            "ltp": float(pick.get("last_price")) if pick.get("last_price") == pick.get("last_price") else None,
+            "oi": float(pick.get("oi_num")) if pick.get("oi_num") == pick.get("oi_num") else None,
+            "volume": float(pick.get("vol_num")) if pick.get("vol_num") == pick.get("vol_num") else None,
+            "spread_pct": float(pick.get("spread_pct")) if pick.get("spread_pct") == pick.get("spread_pct") else None,
+            "price_used": float(pick.get("ask_num") if pick.get("ask_num") == pick.get("ask_num") else pick.get("last_price")),
+            "tag": "long",
+        }]
+        plan_action = "BUY_CE" if side == "LONG" else "BUY_PE"
+        plan_notes = "fallback single-leg"
+        bp = Blueprint(action=plan_action, legs=[LegSpec("BUY", want_right, int(legs[0]["strike"]), "long")], notes=plan_notes, anchor_tag="long")
+    else:
+        want_right = legs[_anchor_leg_index(bp, legs)].get("right")
+
+    anchor_i = _anchor_leg_index(bp, legs)
+    anchor = legs[anchor_i]
+
+    strike = int(anchor["strike"])
+    tsym = str(anchor["tradingsymbol"])
     kite_symbol = f"NFO:{tsym}"
     lot = int(lot_map.get(tsym.upper(), 1))
 
-    bid = float(pick.get("bid_num")) if pick.get("bid_num") == pick.get("bid_num") else None
-    ask = float(pick.get("ask_num")) if pick.get("ask_num") == pick.get("ask_num") else None
-    ltp = float(pick.get("last_price")) if pick.get("last_price") == pick.get("last_price") else None
-    mid = float(pick.get("mid")) if pick.get("mid") == pick.get("mid") else None
-
-    spread_pct = float(pick.get("spread_pct")) if pick.get("spread_pct") == pick.get("spread_pct") else None
+    bid = float(anchor.get("bid")) if anchor.get("bid") is not None else None
+    ask = float(anchor.get("ask")) if anchor.get("ask") is not None else None
+    ltp = float(anchor.get("ltp")) if anchor.get("ltp") is not None else None
+    mid = float(anchor.get("mid")) if anchor.get("mid") is not None else None
+    spread_pct = float(anchor.get("spread_pct")) if anchor.get("spread_pct") is not None else None
 
     entry_opt = ask if ask is not None else ltp
     if entry_opt is None or entry_opt <= 0:
         return None
 
-    px_for_iv = mid if mid is not None and mid > 0 else float(entry_opt)
-    iv, g, greeks_conf, dte = _compute_iv_and_greeks(float(chain.spot), chain.expiry, want_right, strike, px_for_iv)
+    # Compute IV/Greeks per leg and aggregate them for sizing (Phase-4 will do portfolio aggregation)
+    agg_delta = 0.0
+    agg_vega = 0.0
+    agg_theta = 0.0
+    agg_gamma = 0.0
+    greeks_conf = "high"
+    dte = None
+    for lg in legs:
+        px_for_iv = (lg.get("mid") if lg.get("mid") is not None and lg.get("mid") > 0 else lg.get("price_used"))
+        iv_i, g_i, conf_i, dte_i = _compute_iv_and_greeks(float(chain.spot), chain.expiry, lg["right"], int(lg["strike"]), float(px_for_iv))
+        lg["iv"] = float(iv_i)
+        lg["delta"] = float(g_i.get("delta", 0.0))
+        lg["gamma"] = float(g_i.get("gamma", 0.0))
+        lg["vega_1pct"] = float(g_i.get("vega_1pct", 0.0))
+        lg["theta_day"] = float(g_i.get("theta_day", 0.0))
+        lg["greeks_conf"] = conf_i
+        if conf_i == "low":
+            greeks_conf = "low"
+        if dte is None:
+            dte = int(dte_i)
 
-    # Map underlying stop/target to option stop/target using delta (simple approximation)
-    delta_abs = abs(float(g.get("delta", 0.5)))
-    delta_abs = min(0.75, max(0.25, delta_abs))
+        sgn = 1.0 if lg.get("side") == "BUY" else -1.0
+        agg_delta += sgn * float(lg["delta"])
+        agg_vega += sgn * float(lg["vega_1pct"])
+        agg_gamma += sgn * float(lg.get("gamma", 0.0))
+        agg_theta += sgn * float(lg["theta_day"])
 
-    risk_u = abs(entry_u - stop_u)
-    rew_u = abs(target_u - entry_u)
+    # Primary IV: anchor
+    iv = float(anchor.get("iv", 0.0)) if anchor.get("iv") is not None else 0.0
+    g = {"delta": float(agg_delta), "gamma": float(agg_gamma), "vega_1pct": float(agg_vega), "theta_day": float(agg_theta)}
 
-    sl_opt = max(0.05, entry_opt - delta_abs * risk_u)
-    tgt_opt = entry_opt + delta_abs * rew_u
+    # Risk / breakevens
+    net_premium, max_loss, max_profit, breakevens = _compute_plan_risk(plan_action, legs, step)
 
+    # Strategy-aware stop/target in synthetic value space
+    # Stop/Target logic:
+    # - For multi-leg: use strategy value space (net premium) levels
+    # - For single-leg: map underlying stop/target to option using delta, with sanity caps
+    if len(legs) > 1 or plan_action in ("BULL_CALL_SPREAD","BEAR_PUT_SPREAD","BULL_PUT_CREDIT","BEAR_CALL_CREDIT","IRON_CONDOR","LONG_STRADDLE","LONG_STRANGLE"):
+        sl_opt, tgt_opt = _plan_stop_target(plan_action, float(entry_opt), net_premium, max_loss, max_profit)
+    else:
+        # Default for intraday: premium-based levels (avoids absurd targets from underlying mapping).
+        if TRABOT_SINGLE_LEG_SL_TGT_MODE == "premium":
+            sl_opt, tgt_opt = _plan_stop_target(plan_action, float(entry_opt), float(entry_opt), None, None)
+        else:
+                delta_abs = abs(float(anchor.get("delta", 0.5)))
+                delta_abs = min(0.75, max(0.20, delta_abs))
+                try:
+                    risk_u = abs(float(entry_u) - float(stop_u))
+                except Exception:
+                    risk_u = 0.0
+                try:
+                    rew_u = abs(float(target_u) - float(entry_u))
+                except Exception:
+                    rew_u = 0.0
+
+                spot_u = float(chain.spot)
+                max_t_move = max(1e-9, spot_u * float(TRABOT_MAX_TARGET_MOVE_PCT))
+                max_s_move = max(1e-9, spot_u * float(TRABOT_MAX_STOP_MOVE_PCT))
+
+                # target
+                if rew_u <= 0 or rew_u > max_t_move:
+                    # fallback: premium-based target
+                    _, tgt_opt = _plan_stop_target(plan_action, float(entry_opt), float(entry_opt), None, None)
+                else:
+                    tgt_opt = float(entry_opt) + delta_abs * float(rew_u)
+
+                # stop
+                if risk_u <= 0 or risk_u > max_s_move:
+                    sl_opt = max(0.05, float(entry_opt) * 0.50)
+                else:
+                    sl_opt = max(0.05, float(entry_opt) - delta_abs * float(risk_u))
+
+                # cap extreme option targets (prevents insane prints)
+                tgt_opt = min(float(tgt_opt), float(entry_opt) * float(TRABOT_TGT_CAP_MULT))
+
+
+    # price used for caps (conservative): max_loss per contract when available
+    option_price_for_caps = float(max_loss) if (max_loss is not None and max_loss > 0) else float(entry_opt)
     # Score (simple + data-centric)
     adx = float(sig.metrics.get("adx", 0.0))
     score = (0.8 + 0.02 * adx) * sess_factor
@@ -696,7 +1191,7 @@ def _build_candidate(item: dict, lot_map: dict, market_ctx: MarketContext | None
         risk_profile=TRABOT_RISK_PROFILE,
         dte=int(dte),
         spot=float(chain.spot),
-        option_price=float(entry_opt),
+        option_price=float(option_price_for_caps),
         lot_size=int(lot),
         delta=float(g.get("delta", 0.0)),
         vega_1pct=float(g.get("vega_1pct", 0.0)),
@@ -708,6 +1203,44 @@ def _build_candidate(item: dict, lot_map: dict, market_ctx: MarketContext | None
     risk_lots = _risk_lots_from_stop(TRABOT_CAPITAL, float(entry_opt), float(sl_opt), int(lot))
     final_lots = int(min(int(max_lots), int(risk_lots))) if risk_lots > 0 else int(max_lots)
     pass_caps = bool(final_lots >= 1)
+
+    # Phase-4: portfolio caps (optional)
+    if TRABOT_PORTFOLIO_ENABLE and final_lots >= 1:
+        global PORTFOLIO_STATE, CLUSTERS_MAP
+        try:
+            underlying_u = str(item.get("underlying") or "").upper()
+            _tmp = {
+                "ts_reco": ts_reco,
+                "underlying": underlying_u,
+                "expiry": str(chain.expiry),
+                "strategy_type": plan_action,
+                "legs_json": legs_json,
+                "lots": int(final_lots),
+                "lot_size": int(lot),
+                "entry": float(entry_opt),
+                "net_premium": net_premium,
+                "max_loss": max_loss,
+            }
+            new_pos = make_position_from_reco(_tmp, capital=float(TRABOT_CAPITAL), clusters=(CLUSTERS_MAP or {}))
+            ok, reason = check_portfolio_caps(
+                PORTFOLIO_STATE,
+                new_pos,
+                capital=float(TRABOT_CAPITAL),
+                spot=float(chain.spot),
+                max_premium_frac=float(TRABOT_PORTFOLIO_MAX_PREMIUM_FRAC),
+                max_delta_notional_frac=float(TRABOT_PORTFOLIO_MAX_DELTA_NOTIONAL_FRAC),
+                max_vega_frac=float(TRABOT_PORTFOLIO_MAX_VEGA_FRAC),
+                max_gamma_frac=float(TRABOT_PORTFOLIO_MAX_GAMMA_FRAC),
+                max_theta_frac=float(TRABOT_PORTFOLIO_MAX_THETA_FRAC),
+                max_pos_per_underlying=int(TRABOT_PORTFOLIO_MAX_POS_PER_UNDERLYING),
+                max_pos_per_cluster=int(TRABOT_PORTFOLIO_MAX_POS_PER_CLUSTER),
+            )
+            if not ok:
+                return None
+            if TRABOT_PORTFOLIO_RESERVE:
+                PORTFOLIO_STATE = maybe_reserve_position(PORTFOLIO_STATE, new_pos, enabled=True)
+        except Exception:
+            pass
 
     # Explainability notes
     notes = []
@@ -721,11 +1254,64 @@ def _build_candidate(item: dict, lot_map: dict, market_ctx: MarketContext | None
         pass
     notes_str = " | ".join(notes)
 
+    # Phase-3 metadata
+    legs_json = json.dumps(legs, separators=(",", ":"), ensure_ascii=False, default=_json_default)
+    # Quote latency (best-effort)
+    try:
+        now_ist = pd.Timestamp.now(tz="Asia/Kolkata")
+    except Exception:
+        now_ist = None
+    quote_ages = []
+    if now_ist is not None:
+        for lg in legs:
+            tsq = _parse_ts_ist(lg.get("quote_ts"))
+            if tsq is not None:
+                try:
+                    quote_ages.append(float((now_ist - tsq).total_seconds()))
+                except Exception:
+                    pass
+    quote_age_s_max = float(max(quote_ages)) if quote_ages else None
+    quote_age_s_mean = float(sum(quote_ages)/len(quote_ages)) if quote_ages else None
+
+    # Dedup signature (cooldown)
+    sig_parts = []
+    for lg in legs:
+        try:
+            sig_parts.append(f"{str(lg.get('side'))}:{str(lg.get('right'))}:{int(lg.get('strike'))}")
+        except Exception:
+            pass
+    reco_signature = f"{str(item.get('underlying','')).upper()}|{plan_action}|" + ",".join(sig_parts)
+
+    # Robust globals: avoid NameError even if module-level globals were not initialized
+    seen = globals().setdefault("SEEN_SIGNATURES", set())
+    cooldown = globals().setdefault("COOLDOWN_LAST_TS", {})
+
+    if reco_signature in seen:
+        return None
+    try:
+        last_ts = cooldown.get(reco_signature)
+        if last_ts is not None:
+            if (pd.Timestamp(ts_reco) - pd.Timestamp(last_ts)).total_seconds() < float(TRABOT_DEDUP_COOLDOWN_MIN) * 60.0:
+                return None
+    except Exception:
+        pass
+    seen.add(reco_signature)
+    cooldown[reco_signature] = ts_reco
+    margin_est = (float(max_loss) * float(lot)) if (max_loss is not None and lot) else None
+
     return {
         "underlying": item["underlying"],
         "ts_signal": str(last_ts),
         "spot_symbol": item["spot"],
         "expiry": chain.expiry,
+        "action": plan_action,
+        "strategy_type": plan_action,
+        "legs_json": legs_json,
+        "net_premium": net_premium,
+        "max_loss": max_loss,
+        "max_profit": max_profit,
+        "breakevens": breakevens,
+        "margin_est": margin_est,
         "dte": int(dte),
         "regime": regime,
         "regime_conf": float(regime_conf),
@@ -740,6 +1326,7 @@ def _build_candidate(item: dict, lot_map: dict, market_ctx: MarketContext | None
         "kite_symbol": kite_symbol,
         "strike": strike,
         "score": float(score),
+        "signal_strength": float(abs(score)),
         "entry": float(entry_opt),
         "sl": float(sl_opt),
         "target": float(tgt_opt),
@@ -749,7 +1336,7 @@ def _build_candidate(item: dict, lot_map: dict, market_ctx: MarketContext | None
         "ask": ask,
         "mid": mid,
         "ltp": ltp,
-        "quote_ts": pick.get("quote_timestamp") or pick.get("last_trade_time") or "",
+        "quote_ts": anchor.get("quote_ts") or "",
         "entry_model": "ask" if ask is not None else ("mid" if mid is not None else "ltp"),
         "iv": float(iv),
         "iv_pct": float(pct) if pct is not None else float("nan"),
@@ -767,7 +1354,7 @@ def _build_candidate(item: dict, lot_map: dict, market_ctx: MarketContext | None
         "mkt_bias": getattr(market_ctx, "bias", None) if market_ctx else None,
         "mkt_strength": getattr(market_ctx, "strength", None) if market_ctx else None,
         "mkt_risk_off": getattr(market_ctx, "risk_off", None) if market_ctx else None,
-        "notes": notes_str,
+        "notes": (notes_str + (" | " + plan_notes if plan_notes else "")),
         "reason": trigger_text,
         "bos": bos_tag,
         "bos_strength": float(bos_strength),
@@ -778,7 +1365,7 @@ def _build_candidate(item: dict, lot_map: dict, market_ctx: MarketContext | None
 
 def _reco_row(c: dict, ts_str: str, run_id: str, source: str, bucket: str, mode: str) -> dict:
     """Normalize a candidate into the stable reco schema (Phase-1)."""
-    action = "BUY_CE" if c["side"] == "LONG" else "BUY_PE"
+    action = c.get("action") or ("BUY_CE" if c["side"] == "LONG" else "BUY_PE")
     if not c.get("is_live", True):
         action = "WATCH_CE" if c["side"] == "LONG" else "WATCH_PE"
 
@@ -849,6 +1436,15 @@ def _reco_row(c: dict, ts_str: str, run_id: str, source: str, bucket: str, mode:
         "reason": c.get("reason", ""),
         "notes": c.get("notes", ""),
 
+        "strategy_type": c.get("strategy_type", ""),
+        "legs_json": c.get("legs_json", ""),
+        "net_premium": c.get("net_premium", ""),
+        "max_loss": c.get("max_loss", ""),
+        "max_profit": c.get("max_profit", ""),
+        "breakevens": c.get("breakevens", ""),
+        "margin_est": c.get("margin_est", ""),
+        "signal_strength": c.get("signal_strength", ""),
+
         # Anything else will be captured into extra_json by journal.append_history().
     }
 
@@ -879,6 +1475,31 @@ def main(mode: str = "intraday"):
     run_ts = datetime.now()
     ts_str = run_ts.isoformat(timespec="seconds")
     run_id = make_run_id(run_ts)
+    global PORTFOLIO_STATE, CLUSTERS_MAP, COOLDOWN_LAST_TS
+    CLUSTERS_MAP = load_clusters("data/clusters.json")
+    PORTFOLIO_STATE = load_portfolio(TRABOT_PORTFOLIO_STATE_PATH)
+    # load recent signatures for cooldown (best-effort)
+    try:
+        hist_path = os.getenv("TRABOT_RECO_HISTORY", DEFAULT_RECO_HISTORY_PATH)
+        if os.path.exists(hist_path) and TRABOT_DEDUP_COOLDOWN_MIN > 0:
+            h = pd.read_csv(hist_path)
+            if "extra_json" in h.columns and "ts_reco" in h.columns:
+                h["ts_reco"] = pd.to_datetime(h["ts_reco"], errors="coerce")
+                h = h.dropna(subset=["ts_reco"])
+                cutoff = pd.Timestamp.now(tz="Asia/Kolkata") - pd.Timedelta(minutes=int(TRABOT_DEDUP_COOLDOWN_MIN))
+                h = h[h["ts_reco"] >= cutoff]
+                for _, r in h.iterrows():
+                    try:
+                        ej = r.get("extra_json")
+                        if isinstance(ej, str) and ej.strip():
+                            d = json.loads(ej)
+                            sigv = d.get("reco_signature")
+                            if sigv:
+                                COOLDOWN_LAST_TS[str(sigv)] = r["ts_reco"]
+                    except Exception:
+                        continue
+    except Exception:
+        pass
 
     # Mode-aware tuning (intraday vs swing). Overrides are applied to globals so helper functions reuse them.
     mode = (mode or os.getenv("TRABOT_MODE", "intraday")).strip().lower()
@@ -1101,6 +1722,8 @@ def main(mode: str = "intraday"):
                 "n": int(len(qts)),
                 "min": (qt_min.isoformat() if hasattr(qt_min, "isoformat") else str(qt_min)) if qt_min is not None and str(qt_min) != "NaT" else "",
                 "max": (qt_max.isoformat() if hasattr(qt_max, "isoformat") else str(qt_max)) if qt_max is not None and str(qt_max) != "NaT" else "",
+                "age_s_max": float(max([a for a in [c.get("quote_age_s_max") for c in cands] if a is not None], default=0.0)) if cands else 0.0,
+                "age_s_mean": float(sum([a for a in [c.get("quote_age_s_mean") for c in cands] if a is not None]) / max(1, len([a for a in [c.get("quote_age_s_mean") for c in cands] if a is not None]))) if cands else 0.0,
             },
             "outputs": {
                 "options_scan_results_latest": f"data/options_scan_results_v22{suffix}.csv",

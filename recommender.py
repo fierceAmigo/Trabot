@@ -10,6 +10,8 @@ from option_chain import ChainSlice
 Action = Literal[
     "BUY_CE", "BUY_PE",
     "BULL_CALL_SPREAD", "BEAR_PUT_SPREAD",
+    "BULL_PUT_CREDIT", "BEAR_CALL_CREDIT",
+    "LONG_STRADDLE", "LONG_STRANGLE", "IRON_CONDOR",
     "WATCH_CE", "WATCH_PE",
     "NO_TRADE"
 ]
@@ -24,6 +26,10 @@ class OptionLeg:
     instrument_token: Optional[int] = None
     ltp: Optional[float] = None
     oi: Optional[float] = None
+    bid: Optional[float] = None
+    ask: Optional[float] = None
+    mid: Optional[float] = None
+    tag: Optional[str] = None
 
 
 @dataclass
@@ -236,4 +242,95 @@ def build_recommendation(underlying: str, signal, chain: ChainSlice, high_vol_at
         legs=legs,
         chain_preview=preview,
         trigger=trigger,
+    )
+
+
+# ----------------------------
+# Phase-3 entrypoint (optional)
+# ----------------------------
+from strategy_engine import decide_blueprint
+
+
+def build_recommendation_phase3(
+    underlying: str,
+    signal,
+    chain: ChainSlice,
+    *,
+    regime: str,
+    ivp: float | None,
+    signal_strength: float,
+    allow_neutral: bool = True,
+) -> Recommendation:
+    """Build a multi-leg recommendation based on regime + IVP + signal strength.
+
+    This is a lightweight wrapper intended for reuse by scanners/backtests.
+    The full scanner still does richer gates (rate-limit, TTL caches, etc.).
+    """
+    strike_col = chain.strike_col
+
+    # Derive step and width
+    strikes = sorted(pd.concat([chain.calls[strike_col], chain.puts[strike_col]], axis=0).dropna().astype(int).unique().tolist())
+    step = int(pd.Series(strikes).diff().median()) if len(strikes) >= 3 else 50
+    if step <= 0:
+        step = 50
+
+    entry = signal.entry if signal.entry is not None else float(signal.metrics.get("watch_entry", float("nan")))
+    target = signal.target if signal.target is not None else float(signal.metrics.get("watch_target", float("nan")))
+    width = _pick_expected_width(float(entry), float(target), step) if entry and target and not math.isnan(float(entry)) and not math.isnan(float(target)) else 2 * step
+
+    bp = decide_blueprint(
+        side="LONG" if signal.side == "LONG" else "SHORT",
+        regime=(regime or "UNKNOWN"),
+        ivp=ivp,
+        signal_strength=float(signal_strength),
+        atm=int(chain.atm),
+        step=int(step),
+        width=int(width),
+        is_live=signal.side in ("LONG", "SHORT"),
+        allow_neutral=bool(allow_neutral),
+    )
+
+    # Map legs to chain rows (no extra liquidity validation here)
+    legs: List[OptionLeg] = []
+    for spec in bp.legs:
+        df_side = chain.calls if spec.right == "CE" else chain.puts
+        row = _lookup_leg(df_side, strike_col, spec.strike) or {}
+        legs.append(
+            OptionLeg(
+                side=spec.side,
+                right=spec.right,
+                strike=int(row.get(strike_col) or spec.strike),
+                tradingsymbol=row.get("tradingsymbol"),
+                instrument_token=int(row.get("instrument_token")) if row.get("instrument_token") else None,
+                ltp=float(row.get("last_price")) if row.get("last_price") is not None else None,
+                oi=float(row.get("oi")) if row.get("oi") is not None else None,
+                bid=float(row.get("bid")) if row.get("bid") is not None else None,
+                ask=float(row.get("ask")) if row.get("ask") is not None else None,
+                mid=None,
+                tag=spec.tag,
+            )
+        )
+
+    # Keep chain_preview consistent
+    ce = chain.calls.rename(columns={"tradingsymbol":"CE_tradingsymbol","last_price":"CE_ltp","oi":"CE_oi","bid":"CE_bid","ask":"CE_ask","volume":"CE_volume"})
+    pe = chain.puts.rename(columns={"tradingsymbol":"PE_tradingsymbol","last_price":"PE_ltp","oi":"PE_oi","bid":"PE_bid","ask":"PE_ask","volume":"PE_volume"})
+    preview = pd.merge(
+        ce[[strike_col,"CE_tradingsymbol","CE_ltp","CE_oi","CE_bid","CE_ask","CE_volume"]],
+        pe[[strike_col,"PE_tradingsymbol","PE_ltp","PE_oi","PE_bid","PE_ask","PE_volume"]],
+        on=strike_col, how="outer"
+    ).sort_values(strike_col)
+
+    # Use existing reason/metrics; action reflects the blueprint
+    return Recommendation(
+        underlying=underlying,
+        action=bp.action,
+        expiry=chain.expiry,
+        entry_underlying=signal.entry,
+        stop_underlying=signal.stop,
+        target_underlying=signal.target,
+        reason=(signal.reason + (" | " + bp.notes if bp.notes else "")),
+        metrics=signal.metrics,
+        legs=legs,
+        chain_preview=preview,
+        trigger=None,
     )

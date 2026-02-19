@@ -22,7 +22,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 
 # Bump MAJOR when column semantics change.
-RECO_SCHEMA_VERSION: str = os.getenv("TRABOT_RECO_SCHEMA_VERSION", "1").strip() or "1"
+RECO_SCHEMA_VERSION: str = os.getenv("TRABOT_RECO_SCHEMA_VERSION", "3").strip() or "1"
 
 DATA_DIR = os.getenv("TRABOT_DATA_DIR", "data")
 DEFAULT_HISTORY_PATH = os.path.join(DATA_DIR, f"reco_history_v{RECO_SCHEMA_VERSION}.csv")
@@ -104,6 +104,23 @@ RECO_COLUMNS: List[str] = [
     # explainability
     "reason",
     "notes",
+
+    # Phase-3: multi-leg strategy fields (populated when applicable)
+    "strategy_type",
+    "legs_json",
+    "net_premium",
+    "max_loss",
+    "max_profit",
+    "breakevens",
+    "margin_est",
+    "signal_strength",
+    "gamma",
+    "legs_count",
+    "quote_age_s_max",
+    "quote_age_s_mean",
+    "cluster",
+    "fill_model",
+    "fill_k",
 
     # overflow for forward-compat
     "extra_json",

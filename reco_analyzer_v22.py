@@ -107,6 +107,66 @@ def to_ist(ts) -> pd.Timestamp:
     return t.tz_convert(IST)
 
 
+
+def _parse_hhmm(s: str) -> tuple[int, int]:
+    try:
+        s = (s or "").strip()
+        hh, mm = s.split(":")
+        return int(hh), int(mm)
+    except Exception:
+        return 9, 15
+
+
+def _is_weekend(ts: pd.Timestamp) -> bool:
+    try:
+        return int(ts.weekday()) >= 5
+    except Exception:
+        return False
+
+
+def _next_trading_day(d: dt.date) -> dt.date:
+    nd = d + dt.timedelta(days=1)
+    while nd.weekday() >= 5:
+        nd = nd + dt.timedelta(days=1)
+    return nd
+
+
+def adjust_entry_ts(ts_reco: pd.Timestamp, *, entry_mode: str, mkt_open: str, mkt_close: str) -> pd.Timestamp:
+    """Adjust entry timestamp for analysis.
+
+    entry_mode:
+      - as_is: use ts_reco as entry reference (default)
+      - next_open: if ts_reco is outside market hours, shift to next trading day open (IST).
+    """
+    ts = to_ist(ts_reco)
+    mode = (entry_mode or "as_is").strip().lower()
+    if mode != "next_open":
+        return ts
+
+    try:
+        oh, om = _parse_hhmm(mkt_open)
+        ch, cm = _parse_hhmm(mkt_close)
+        open_t = dt.time(hour=oh, minute=om)
+        close_t = dt.time(hour=ch, minute=cm)
+    except Exception:
+        open_t = dt.time(9, 15)
+        close_t = dt.time(15, 30)
+
+    t = ts.time()
+    out_of_hours = (t < open_t) or (t > close_t) or _is_weekend(ts)
+    if not out_of_hours:
+        return ts
+
+    nd = ts.date()
+    if t >= close_t or _is_weekend(ts):
+        nd = _next_trading_day(nd)
+    else:
+        while nd.weekday() >= 5:
+            nd = _next_trading_day(nd)
+
+    return pd.Timestamp(dt.datetime(nd.year, nd.month, nd.day, open_t.hour, open_t.minute), tz="Asia/Kolkata")
+
+
 def ensure_index_ist(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
@@ -254,9 +314,10 @@ def evaluate_path_with_mfe_mae(
     Evaluate a single recommendation on option candles.
 
     Execution model (phase-5 baseline):
-      - optimistic: entry/exit at candle prices (k=0)
-      - realistic: entry worse + exit worse by k * spread_pct (default k=0.25)
-      - pessimistic: entry/exit penalized by full spread_pct (k=1)
+      - mid / optimistic: no penalty (k_eff=0)
+      - mid_k / realistic: k_eff = fill_k (default 0.25)
+      - bid / ask: half-spread penalty (k_eff=0.5)
+      - pessimistic: full-spread penalty (k_eff=1)
 
     Note: We still use candle HIGH/LOW for SL/Target hit detection (no bid/ask candle series).
     """
@@ -272,17 +333,37 @@ def evaluate_path_with_mfe_mae(
 
     entry_ts = after.index[0]
     entry_px_raw = float(after.iloc[0]["open"])
-    if entry_px_raw <= 0 or sl <= 0 or target <= 0:
+    # Allow negative entry/levels (credit structures). Validate ordering.
+    if not (entry_px_raw == entry_px_raw) or abs(entry_px_raw) <= 1e-9:
         return {"status": "BAD_LEVELS"}
+    try:
+        sl_f = float(sl)
+        tgt_f = float(target)
+    except Exception:
+        return {"status": "BAD_LEVELS"}
+    # Ensure sl < target
+    if sl_f > tgt_f:
+        sl_f, tgt_f = tgt_f, sl_f
+    sl = sl_f
+    target = tgt_f
+    # If entry lies outside [sl,target], still proceed but metrics may be less meaningful.
 
     sp = float(spread_pct or 0.0)
     sp = max(0.0, min(sp, 0.80))
     fm = (fill_model or "realistic").strip().lower()
-    k_eff = 0.0 if fm == "optimistic" else (1.0 if fm == "pessimistic" else float(fill_k))
-    k_eff = max(0.0, min(k_eff, 1.0))
+    if fm in ("mid", "optimistic"):
+        k_eff = 0.0
+    elif fm in ("pessimistic",):
+        k_eff = 1.0
+    elif fm in ("bid", "ask"):
+        k_eff = 0.5
+    else:  # realistic / mid_k
+        k_eff = float(fill_k)
+    k_eff = max(0.0, min(float(k_eff), 1.0))
 
-    # For long option buys: pay up on entry, get worse on exit.
-    entry_px = entry_px_raw * (1.0 + k_eff * sp)
+    # Fill penalty in value space (works for debit and credit):
+    # entry worsens toward 0 by k*spread*abs(entry)
+    entry_px = float(entry_px_raw) + (k_eff * sp * abs(float(entry_px_raw)))
 
     # MFE/MAE measured from entry until exit (using raw candle extrema vs fill-adjusted entry)
     max_fav = 0.0
@@ -314,8 +395,8 @@ def evaluate_path_with_mfe_mae(
         exit_ts = after.index[-1]
         exit_px_raw = float(after.iloc[-1]["close"])
 
-    # Exit fill (sell) worse by spread penalty
-    exit_px = float(exit_px_raw) * (1.0 - k_eff * sp)
+    # Exit worsens against the trader by k*spread*abs(exit)
+    exit_px = float(exit_px_raw) - (k_eff * sp * abs(float(exit_px_raw)))
 
     pnl = exit_px - entry_px
     pnl_pct = pnl / entry_px if entry_px > 0 else 0.0
@@ -351,6 +432,147 @@ def evaluate_path_with_mfe_mae(
     }
 
 
+
+
+# ----------------------------
+# Phase-3: multi-leg evaluation
+# ----------------------------
+
+def parse_legs_json(s: str) -> list[dict]:
+    """Parse legs_json written by scanner. Returns [] if missing/bad."""
+    if s is None:
+        return []
+    try:
+        st = str(s).strip()
+        if not st or st.lower() in ("nan", "none", "null"):
+            return []
+        legs = json.loads(st)
+        if isinstance(legs, list):
+            out = []
+            for lg in legs:
+                if not isinstance(lg, dict):
+                    continue
+                tsym = lg.get("tradingsymbol") or lg.get("tsym") or ""
+                if not tsym:
+                    continue
+                out.append({
+                    "side": str(lg.get("side") or "BUY").upper(),
+                    "tradingsymbol": str(tsym),
+                    "spread_pct": lg.get("spread_pct"),
+                })
+            return out
+    except Exception:
+        return []
+    return []
+
+
+def build_synthetic_candles(
+    legs: list[dict],
+    ts_reco: pd.Timestamp,
+    end_ist: pd.Timestamp,
+    interval: str,
+) -> tuple[pd.DataFrame | None, float]:
+    """Fetch candles for each leg and build a synthetic OHLCV in net-premium space.
+
+    Returns (df, spread_pct_plan).
+    - df columns: open, high, low, close, volume
+    - spread_pct_plan: max spread_pct across legs (best-effort)
+    """
+    if not legs:
+        return None, 0.0
+
+    dfs = []
+    spreads = []
+    for lg in legs:
+        tsym = str(lg.get("tradingsymbol"))
+        opt_df = fetch_option_candles(tsym, ts_reco, end_ist, interval)
+        if opt_df is None or opt_df.empty:
+            return None, 0.0
+        opt_df = ensure_index_ist(opt_df).sort_index()
+
+        sign = 1.0 if str(lg.get("side","BUY")).upper() == "BUY" else -1.0
+
+        # Keep only OHLCV
+        keep = opt_df[["open","high","low","close","volume"]].copy()
+        keep = keep.astype(float)
+        for c in ["open","high","low","close"]:
+            keep[c] = sign * keep[c]
+
+        keep = keep.rename(columns={c: f"{tsym}:{c}" for c in keep.columns})
+        dfs.append(keep)
+
+        try:
+            sp = lg.get("spread_pct")
+            if sp is not None and str(sp).strip() != "":
+                spreads.append(float(sp))
+        except Exception:
+            pass
+
+    # Outer join then ffill each leg series to align timestamps
+    merged = dfs[0]
+    for d in dfs[1:]:
+        merged = merged.join(d, how="outer")
+
+    merged = merged.sort_index().ffill()
+
+    # If the first row still has NaNs (missing at start), drop until complete
+    merged = merged.dropna(how="any")
+    if merged.empty:
+        return None, 0.0
+
+    out = pd.DataFrame(index=merged.index)
+    out["open"] = 0.0
+    out["close"] = 0.0
+    out["volume"] = 0.0
+
+    # For high/low of NET VALUE, shorts invert the extrema:
+    # net_high = sum(buy_high) - sum(short_low)
+    # net_low  = sum(buy_low)  - sum(short_high)
+    out["high"] = 0.0
+    out["low"] = 0.0
+
+    # Identify leg symbols and whether they are BUY or SELL by column name prefix
+    leg_symbols = sorted({c.split(":")[0] for c in merged.columns if ":" in c})
+
+    for sym in leg_symbols:
+        o = merged.get(f"{sym}:open")
+        h = merged.get(f"{sym}:high")
+        l = merged.get(f"{sym}:low")
+        c = merged.get(f"{sym}:close")
+        v = merged.get(f"{sym}:volume")
+
+        # Determine side sign from the first non-null open of this symbol:
+        # In our join step, we already multiplied BUY by +1 and SELL by -1 for open/close/volume,
+        # but high/low need special handling, so we infer side from the sign of open series.
+        side_is_buy = True
+        try:
+            side_is_buy = bool((o.dropna().iloc[0]) >= 0)
+        except Exception:
+            side_is_buy = True
+
+        if o is not None:
+            out["open"] += o
+        if c is not None:
+            out["close"] += c
+        if v is not None:
+            out["volume"] += v
+
+        if side_is_buy:
+            if h is not None: out["high"] += h
+            if l is not None: out["low"] += l
+        else:
+            # short leg: value = -price. maximize value uses -low; minimize uses -high.
+            if l is not None: out["high"] += (-1.0 * l)
+            if h is not None: out["low"] += (-1.0 * h)
+
+    # Ensure high >= max(open,close) and low <= min(open,close) (best-effort)
+    out["high"] = out[["high","open","close"]].max(axis=1)
+    out["low"] = out[["low","open","close"]].min(axis=1)
+
+    spread_pct_plan = max(spreads) if spreads else 0.0
+    return out, float(spread_pct_plan)
+
+
 def loss_tags(row: dict) -> str:
     tags = []
     pnl_pct = float(row.get("pnl_pct", 0.0))
@@ -361,6 +583,10 @@ def loss_tags(row: dict) -> str:
     delta = row.get("delta", None)
     move_fav = row.get("spot_move_pct_favorable", None)
     mfe_frac = row.get("mfe_frac_to_target", None)
+    spread = row.get("spread_pct", None)
+    legs_count = row.get("legs_count", None)
+    entry = row.get("entry", None)
+    qage = row.get("quote_age_s_max", None)
 
     if dte is not None:
         try:
@@ -404,6 +630,35 @@ def loss_tags(row: dict) -> str:
             except Exception:
                 pass
 
+
+    # Execution / microstructure attribution
+    if spread is not None:
+        try:
+            if float(spread) >= 0.08:
+                tags.append("SPREAD_WIDE")
+        except Exception:
+            pass
+
+    if legs_count is not None:
+        try:
+            if int(legs_count) > 1:
+                tags.append("MULTI_LEG")
+        except Exception:
+            pass
+
+    if entry is not None:
+        try:
+            if float(entry) < 0:
+                tags.append("CREDIT_STRUCTURE")
+        except Exception:
+            pass
+
+    if qage is not None:
+        try:
+            if float(qage) > 5.0:
+                tags.append("STALE_QUOTES")
+        except Exception:
+            pass
     if hit == "BOTH_SAME_BAR":
         tags.append("AMBIGUOUS_BAR")
 
@@ -515,8 +770,11 @@ def main():
     ap.add_argument("--last_n", type=int, default=0)
     ap.add_argument("--from_date", default="")
     ap.add_argument("--include_watch", action="store_true")
-    ap.add_argument("--fill_model", choices=["optimistic", "realistic", "pessimistic"], default=os.getenv("TRABOT_FILL_MODEL", "realistic"))
+    ap.add_argument("--fill_model", choices=["mid","mid_k","bid","ask","optimistic","realistic","pessimistic"], default=os.getenv("TRABOT_FILL_MODEL", "realistic"))
     ap.add_argument("--fill_k", type=float, default=float(os.getenv("TRABOT_FILL_K", "0.25")))
+    ap.add_argument("--entry_mode", choices=["as_is","next_open"], default=os.getenv("TRABOT_ENTRY_MODE", "as_is"))
+    ap.add_argument("--mkt_open", default=os.getenv("TRABOT_MKT_OPEN", "09:15"))
+    ap.add_argument("--mkt_close", default=os.getenv("TRABOT_MKT_CLOSE", "15:30"))
     ap.add_argument("--bad_lines", choices=["error", "skip"], default=os.getenv("TRABOT_BAD_LINES", "skip"))
     args = ap.parse_args()
 
@@ -557,16 +815,21 @@ def main():
 
     for _, r in df.iterrows():
         ts_reco = to_ist(r["ts_reco"])
+        ts_entry = adjust_entry_ts(ts_reco, entry_mode=args.entry_mode, mkt_open=args.mkt_open, mkt_close=args.mkt_close)
         tsym = str(r.get("tradingsymbol") or "").strip()
         if not tsym:
             continue
+
+        base_row = r.to_dict()
+        base_row["entry_mode"] = str(args.entry_mode)
+        base_row["ts_entry_effective"] = (ts_entry.isoformat() if hasattr(ts_entry, "isoformat") else str(ts_entry))
 
         try:
             entry = float(r.get("entry") or 0.0)
             sl = float(r.get("sl") or 0.0)
             tgt = float(r.get("target") or 0.0)
         except Exception:
-            out_rows.append({**r.to_dict(), "eval_status": "BAD_LEVELS"})
+            out_rows.append({**base_row, "eval_status": "BAD_LEVELS"})
             continue
 
         # horizon uses per-row time_stop_min if present, else max_hours
@@ -582,37 +845,46 @@ def main():
             horizon_hours = min(horizon_hours, time_stop_min / 60.0)
 
         exp_end = expiry_end_ist(str(r.get("expiry") or "").strip())
-        end_ist = ts_reco + pd.Timedelta(hours=float(horizon_hours))
+        end_ist = ts_entry + pd.Timedelta(hours=float(horizon_hours))
         if exp_end is not None:
             end_ist = min(end_ist, exp_end)
         if end_ist <= ts_reco:
-            out_rows.append({**r.to_dict(), "eval_status": "SKIP_EXPIRED"})
+            out_rows.append({**base_row, "eval_status": "SKIP_EXPIRED"})
             continue
 
         try:
-            opt_df = fetch_option_candles(tsym, ts_reco, end_ist, args.interval)
+            legs = parse_legs_json(r.get("legs_json", ""))
+            if legs:
+                opt_df, spread_plan = build_synthetic_candles(legs, ts_entry, end_ist, args.interval)
+                if opt_df is None or opt_df.empty:
+                    out_rows.append({**base_row, "eval_status": "NO_CANDLES"})
+                    continue
+            else:
+                opt_df = fetch_option_candles(tsym, ts_reco, end_ist, args.interval)
+                spread_plan = 0.0
         except Exception as e:
-            out_rows.append({**r.to_dict(), "eval_status": f"OPT_FETCH_FAIL: {e}"})
+            out_rows.append({**base_row, "eval_status": f"OPT_FETCH_FAIL: {e}"})
             continue
 
-        spread = 0.0
-        try:
-            if str(r.get("spread_pct", "")).strip() != "":
-                spread = float(r.get("spread_pct"))
-        except Exception:
-            spread = 0.0
+        spread = float(spread_plan or 0.0)
+        if spread <= 0:
+            try:
+                if str(r.get("spread_pct", "")).strip() != "":
+                    spread = float(r.get("spread_pct"))
+            except Exception:
+                spread = 0.0
 
         ev = evaluate_path_with_mfe_mae(
             opt_df,
-            ts_reco,
+            ts_entry,
             sl,
             tgt,
             spread_pct=spread,
-            fill_model=args.fill_model,
-            fill_k=args.fill_k,
+            fill_model=(str(row.get("fill_model") or "").strip().lower() or args.fill_model),
+            fill_k=(float(row.get("fill_k")) if str(row.get("fill_k") or "").strip() not in ("", "nan", "None") else args.fill_k),
         )
         if ev.get("status") != "OK":
-            out_rows.append({**r.to_dict(), "eval_status": ev.get("status")})
+            out_rows.append({**base_row, "eval_status": ev.get("status")})
             continue
 
         # signed favorable spot move heuristic (best-effort, optional)

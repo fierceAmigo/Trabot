@@ -293,3 +293,46 @@ At a high level it:
 - Lists the core libs needed for dataframes, math, env loading, and Kite API.
 
 ---
+
+## Phase 4–6 (production upgrades)
+
+### Phase 4: Portfolio-level risk caps (optional)
+Trabot can (optionally) block recommendations that would violate portfolio caps.
+
+Enable:
+```bash
+export TRABOT_PORTFOLIO_ENABLE=1
+# if you want the scanner to reserve accepted recos into portfolio_state.json during the run:
+export TRABOT_PORTFOLIO_RESERVE=1
+```
+
+State file (default): `data/portfolio_state.json`  
+Cluster mapping (optional): `data/clusters.json` (e.g. `{"SBIN":"BANKS","AUROPHARMA":"PHARMA"}`)
+
+Main caps:
+- `TRABOT_PORTFOLIO_MAX_PREMIUM_FRAC` (default 0.35)
+- `TRABOT_PORTFOLIO_MAX_DELTA_NOTIONAL_FRAC` (default 0.60)
+- `TRABOT_PORTFOLIO_MAX_POS_PER_UNDERLYING` (default 2)
+- `TRABOT_PORTFOLIO_MAX_POS_PER_CLUSTER` (default 4)
+
+### Phase 5: Execution realism (fills + spread-aware triggers)
+Analyzer uses `execution.py` for:
+- entry worse by `k * spread_pct`
+- exit worse by `k * spread_pct`
+- SL/Target detection on *approx executable* high/low (spread-adjusted)
+
+You can still override analyzer fill model:
+```bash
+python reco_analyzer_v22.py --fill_model realistic --fill_k 0.25
+```
+
+### Phase 6: Analyzer + tuning
+Analyzer summary includes:
+- Profit factor, Sharpe, Sortino, max drawdown
+- loss attribution tags (SPREAD_WIDE, MULTI_LEG, CREDIT_STRUCTURE, STALE_QUOTES, etc.)
+
+Walk-forward tuning on the analyzer output (no candle refetch):
+```bash
+python walkforward_tuner.py --csv data/reco_evaluated_v22_latest.csv
+```
+Outputs: `data/walkforward_report_latest.txt`
