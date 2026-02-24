@@ -1,338 +1,647 @@
-
 # Trabot
 
-## Project desc
+**Options Research Bot for Indian Markets**
 
-Trabot is an educational options “research bot” for Indian markets built around Zerodha Kite Connect.
+An educational options scanner built on Zerodha Kite Connect. Scans NSE/NFO underlyings, generates directional signals, selects option structures, applies risk caps, and journals recommendations for later analysis.
 
-At a high level it:
-- Pulls **underlying price candles** (via Kite historical data), computes a **directional signal** using indicators (EMA/RSI/ADX/ATR).
-- Pulls a **small option-chain slice around ATM** (calls + puts) from Kite (NFO instruments + live quotes).
-- Converts the signal into a **human-readable trade plan** (watch trigger, entry/SL/target on underlying levels) and suggests **which option contract(s)** to consider (CE/PE or spread in some cases).
-- Provides **universe scanners** that iterate through many underlyings, apply liquidity/quality gates, compute IV + Greeks, apply risk/position sizing caps, and write results into CSVs.
-- Keeps an **append-only journal** of “recommendations” so you can later evaluate how they performed.
-
-> ⚠️ Educational tool only. Not financial advice.
+> **Disclaimer:** Educational tool only. Not financial advice. Use at your own risk.
 
 ---
 
-## backtest.py
+## Table of Contents
 
-**What it does:** A tiny candle-based forward simulator used for quick research/backtests.
-
-**Logic (plain English):**
-- For each “trade entry” candle index, it assumes entry at the **next candle open**.
-- It then scans forward candle-by-candle until it hits **stop**, **target**, or a **time-based exit**.
-- Produces an “R multiple” outcome (risk-normalized return) and summary stats.
-
----
-
-## config.py
-
-**What it does:** Central place to configure the default underlying, timeframe, indicator periods, strike step, and backtest knobs.
-
-**Logic (plain English):**
-- You set things like `UNDERLYING`, `KITE_SYMBOL`, `INTERVAL`, EMA/RSI/ADX/ATR periods, stop/target ATR multipliers, strike step, and chain window width.
-- Other scripts import these defaults so you don’t hardcode values everywhere.
+- [Quick Start](#quick-start)
+- [Architecture](#architecture)
+- [Module Reference](#module-reference)
+- [Environment Variables](#environment-variables)
+- [Data Files](#data-files)
+- [Usage Examples](#usage-examples)
 
 ---
 
-## indicators.py
+## Quick Start
 
-**What it does:** Lightweight indicator helpers (EMA, RSI, ATR, ADX, z-score) with flexible column handling.
+### 1. Install Dependencies
 
-**Logic (plain English):**
-- Accepts dataframes with either `open/high/low/close` or `Open/High/Low/Close`.
-- Computes indicators used by pattern detection and helper logic.
-
----
-
-## iv_greeks.py
-
-**What it does:** Black–Scholes implied volatility and Greeks approximation.
-
-**Logic (plain English):**
-- Uses a robust **bisection solver** to estimate IV from the option price.
-- Computes **delta/gamma/vega/theta**; theta is returned per day (handy for risk caps).
-- Also includes helpers for time-to-expiry in years.
-
----
-
-## iv_store.py
-
-**What it does:** Stores IV snapshots and computes rolling IV percentile.
-
-**Logic (plain English):**
-- Appends IV snapshots to a CSV history (e.g. `data/iv_history.csv`).
-- Cleans data (skips invalid IV values) and keeps a “daily-ish” history.
-- Computes **IV percentile** over a rolling window with EWMA smoothing, returning a value in `[0, 1]`.
-
----
-
-## journal.py
-
-**What it does:** Append-only journal of recommendations.
-
-**Logic (plain English):**
-- Appends each run’s recommendations into a single `data/reco_history.csv` (never overwritten).
-- Also writes per-run “snapshot” CSVs so you can diff runs over time.
-
----
-
-## kite_client.py
-
-**What it does:** Creates an authenticated KiteConnect client.
-
-**Logic (plain English):**
-- Reads `KITE_API_KEY` and `KITE_ACCESS_TOKEN` from `.env`.
-- Returns a ready-to-use `KiteConnect` client instance for the rest of the modules.
-
----
-
-## kite_login.py
-
-**What it does:** One-time helper to generate and store a Kite access token.
-
-**Logic (plain English):**
-- Prints the Kite login URL, asks you to paste back the `request_token`.
-- Exchanges it for `access_token` using `KITE_API_SECRET`.
-- Writes/updates `KITE_ACCESS_TOKEN=...` into `.env`.
-
----
-
-## kite_chain.py
-
-**What it does:** Builds a tight option-chain slice around ATM using Kite.
-
-**Logic (plain English):**
-- Loads NFO instruments (cached to `data/kite_instruments_NFO.csv` for speed).
-- Picks an expiry (supports DTE band: `min_dte_days` / `max_dte_days`).
-- Finds spot price + ATM strike and fetches quotes for strikes around ATM.
-- Returns a `ChainSlice` containing calls/puts dataframes + spot/ATM.
-
----
-
-## main.py
-
-**What it does:** Single-underlying “demo runner” that prints market state + signal + suggested option legs.
-
-**Logic (plain English):**
-1. Fetch recent candles for the configured symbol and interval.
-2. Compute signal (trend/strength/levels) from indicators.
-3. Fetch option chain slice and “align” entry/SL/target to live spot (because candle close may lag).
-4. Build a recommendation (CE/PE/spread/watch) and print it.
-5. Optionally runs a walk-forward backtest over the fetched candle window.
-
----
-
-## market_data.py
-
-**What it does:** Fetches and caches historical candles using Kite.
-
-**Logic (plain English):**
-- Converts friendly interval strings (`15m`, `day`, etc.) into Kite’s interval names.
-- Resolves instrument tokens (prefers `ltp()` token, falls back to instruments dump).
-- Fetches historical data in safe chunks (Kite has limits).
-- Caches candles in `data/candle_cache/` so repeated scans don’t hammer the API.
-
----
-
-## market_sentiment.py
-
-**What it does:** Builds a lightweight “market context” snapshot using only Kite-available signals.
-
-**Logic (plain English):**
-- Uses **India VIX** level + percentile as a regime proxy.
-- Computes option-chain aggregates like **PCR** (from OI/volume) and a simple **skew proxy**.
-- Finds “OI walls” (strikes with largest OI) as rough support/resistance markers.
-- Adds index trend direction using the same `strategy.compute_signal()` logic.
-- Appends snapshots to `data/market_sentiment_history.csv`.
-
----
-
-## option_chain.py
-
-**What it does:** Backwards-compatible wrapper around `kite_chain.get_kite_chain_slice()`.
-
-**Logic (plain English):**
-- Keeps the old `get_chain_slice()` API so the rest of the code can stay stable.
-- Pulls defaults from `config.py`.
-
----
-
-## patterns.py
-
-**What it does:** Pattern / setup idea generator (trade ideas, not orders).
-
-**Logic (plain English):**
-- Normalizes candle columns and datetime handling.
-- Runs a few setup detectors:
-  - **Donchian breakout**: looks for range breakouts.
-  - **Pullback trend**: trend + retracement style setup.
-  - **Bollinger mean reversion**: “stretch then snap back” logic.
-  - **Volatility squeeze**: compression then expansion potential.
-- Outputs a list of `TradeIdea` objects with entry/stop/target and confidence.
-
----
-
-## reco_analyzer.py
-
-**What it does:** Evaluates historical recommendations from `data/reco_history.csv` using option candles.
-
-**Logic (plain English):**
-- Treats each journal row as “entered immediately after the recommendation time”.
-- Uses the first candle OPEN after `ts_reco` as entry.
-- Checks each candle for SL/target hits; flags ambiguous “both hit same bar”.
-- Produces evaluated CSV + a text summary (win-rate, common loss tags, etc.).
-
----
-
-## reco_analyzer_v22.py
-
-**What it does:** Updated evaluator with more detailed metrics.
-
-**Logic (plain English):**
-- Same concept as `reco_analyzer.py`, but adds:
-  - Better IST safety,
-  - MFE/MAE tracking,
-  - Target reach fraction,
-  - Uses per-row `time_stop_min` if available.
-- Writes “latest” plus timestamped evaluated outputs.
-
----
-
-## recommender.py
-
-**What it does:** Converts a `Signal` + `ChainSlice` into a “what to buy/watch” recommendation.
-
-**Logic (plain English):**
-- Builds a merged “preview table” (CE + PE side-by-side by strike).
-- If the signal is `NO_TRADE`, outputs a **WATCH** recommendation with a trigger condition.
-- If signal is LONG/SHORT, picks a contract near ATM (and may pick spread width based on expected move).
-- Returns a structured `Recommendation` with legs, levels, reason, and a chain preview.
-
----
-
-## risk_caps.py
-
-**What it does:** Greeks-based position sizing and safety caps.
-
-**Logic (plain English):**
-- Calculates max lots based on:
-  - Premium exposure,
-  - Delta-notional exposure,
-  - Vega (1% IV move sensitivity),
-  - Theta (daily decay).
-- Scales caps by capital + regime multipliers + confidence multipliers.
-- Optionally tightens size for very near expiry (DTE penalty).
-
----
-
-## scan_options.py
-
-**What it does:** Full-universe scanner (older V2.1 style).
-
-**Logic (plain English):**
-- Builds a universe of optionable underlyings from the NFO instruments list.
-- For each underlying:
-  - fetches history (cached),
-  - computes a directional signal,
-  - grabs an ATM-centered chain slice,
-  - scores candidate strikes with liquidity filters,
-  - estimates IV + Greeks,
-  - writes ranked results + top picks.
-- Appends Top picks into `data/reco_history.csv` and writes run snapshots.
-
----
-
-## scan_options_global.py
-
-**What it does:** Global scan variant that can optionally incorporate “global context”.
-
-**Logic (plain English):**
-- Same scanning core, but may adjust scoring with a “risk-on/risk-off” bias if `yfinance` is available.
-- Adds additional heuristics (liquidity thresholds by index vs stock, slippage model, “learned edge” style helper).
-- Produces candidate recommendations across the universe.
-
----
-
-## scan_options_global_v22.py
-
-**What it does:** Lean V2.2 global scan.
-
-**Logic (plain English):**
-- Uses a directional confidence gate + high IV gate.
-- Picks strikes using delta targeting and liquidity scoring.
-- Builds option-based SL/target and time stop.
-- Writes global scan results + reco latest + appends to reco_history.
-
----
-
-## scan_options_v22.py
-
-**What it does:** Full-universe scanner with V2.2 upgrades (IV percentile + regime + sentiment + risk caps).
-
-**Logic (plain English):**
-- Builds a universe from NFO instruments and iterates through underlyings.
-- For each underlying:
-  1. Fetch candles → compute signal (trend, levels, confidence proxies).
-  2. Fetch chain slice → score strikes using liquidity gates (spread/OI/volume/min premium).
-  3. Compute IV + Greeks for the chosen contract.
-  4. Compute IV percentile and label regime (TREND/CHOP/VOLATILE).
-  5. Pull market context (VIX/PCR/skew/OI-walls) and adjust risk/scoring.
-  6. Compute position sizing via `risk_caps`.
-- Writes scan result CSVs, “top 10” outputs, `reco_latest`, and appends to `reco_history.csv`.
-
----
-
-## requirements.txt
-
-**What it does:** Minimal Python dependencies list.
-
-**Logic (plain English):**
-- Lists the core libs needed for dataframes, math, env loading, and Kite API.
-
----
-
-## Phase 4–6 (production upgrades)
-
-### Phase 4: Portfolio-level risk caps (optional)
-Trabot can (optionally) block recommendations that would violate portfolio caps.
-
-Enable:
 ```bash
-export TRABOT_PORTFOLIO_ENABLE=1
-# if you want the scanner to reserve accepted recos into portfolio_state.json during the run:
-export TRABOT_PORTFOLIO_RESERVE=1
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-State file (default): `data/portfolio_state.json`  
-Cluster mapping (optional): `data/clusters.json` (e.g. `{"SBIN":"BANKS","AUROPHARMA":"PHARMA"}`)
+### 2. Configure Kite API
 
-Main caps:
-- `TRABOT_PORTFOLIO_MAX_PREMIUM_FRAC` (default 0.35)
-- `TRABOT_PORTFOLIO_MAX_DELTA_NOTIONAL_FRAC` (default 0.60)
-- `TRABOT_PORTFOLIO_MAX_POS_PER_UNDERLYING` (default 2)
-- `TRABOT_PORTFOLIO_MAX_POS_PER_CLUSTER` (default 4)
+Create a `.env` file:
 
-### Phase 5: Execution realism (fills + spread-aware triggers)
-Analyzer uses `execution.py` for:
-- entry worse by `k * spread_pct`
-- exit worse by `k * spread_pct`
-- SL/Target detection on *approx executable* high/low (spread-adjusted)
-
-You can still override analyzer fill model:
 ```bash
+KITE_API_KEY=your_api_key
+KITE_API_SECRET=your_api_secret
+```
+
+Generate access token:
+
+```bash
+python kite_login.py
+```
+
+### 3. Run Health Check
+
+```bash
+python doctor.py
+```
+
+### 4. Run Scanner
+
+```bash
+# Intraday mode (default)
+python scan_options_v22.py --mode intraday
+
+# Swing mode
+python scan_options_v22.py --mode swing
+```
+
+---
+
+## Architecture
+
+Trabot is organized into 6 phases, each adding capabilities:
+
+```
+Phase 1: Data Integrity          Phase 2: Regime Detection
++-----------------------+        +-----------------------+
+| trabot_schema.py      |        | regime.py             |
+| run_manifest.py       |        | - TREND/CHOP/VOLATILE |
+| io_utils.py           |        | - Multi-TF alignment  |
+| journal.py            |        +-----------------------+
++-----------------------+
+                                 Phase 3: Strategy Engine
+Phase 4: Portfolio Risk          +-----------------------+
++-----------------------+        | strategy_engine.py    |
+| portfolio.py          |        | - Debit spreads       |
+| correlation.py        |        | - Credit spreads      |
+| portfolio_kite.py     |        | - Iron condors        |
++-----------------------+        | - Straddles/strangles |
+                                 +-----------------------+
+Phase 5: Execution Realism
++-----------------------+        Phase 6: Analysis
+| execution.py          |        +-----------------------+
+| quotes.py             |        | reco_analyzer_v22.py  |
+| throttle.py           |        | walkforward_tuner.py  |
+| kite_client.py        |        | tuning.py             |
++-----------------------+        +-----------------------+
+```
+
+### Signal Flow
+
+```
+┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+│ market_data │───>│  strategy   │───>│   regime    │───>│  strategy   │
+│  (candles)  │    │  (signal)   │    │ (detection) │    │   engine    │
+└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
+                                                                │
+┌─────────────┐    ┌─────────────┐    ┌─────────────┐           │
+│  portfolio  │<───│  risk_caps  │<───│  iv_greeks  │<──────────┘
+│   (caps)    │    │  (sizing)   │    │  (Greeks)   │
+└─────────────┘    └─────────────┘    └─────────────┘
+                          │
+                          v
+                   ┌─────────────┐
+                   │   journal   │
+                   │  (output)   │
+                   └─────────────┘
+```
+
+---
+
+## Module Reference
+
+### Core Scanner
+
+#### `scan_options_v22.py`
+**Main universe scanner with all phases integrated.**
+
+- Builds universe from NFO instruments
+- Fetches candles via `market_data.py`
+- Computes signal via `strategy.py`
+- Detects regime via `regime.py` (TREND/CHOP/VOLATILE)
+- Selects structure via `strategy_engine.py` (spreads, condors, single-leg)
+- Computes IV + Greeks via `iv_greeks.py`
+- Applies position sizing via `risk_caps.py`
+- Checks portfolio caps via `portfolio.py` (optional)
+- Deduplicates with cooldown window
+- Outputs: CSV files + appends to `reco_history.csv`
+
+Modes: `intraday` (15m candles, 0-7 DTE) or `swing` (60m candles, 4-14 DTE)
+
+---
+
+### Signal Generation
+
+#### `strategy.py`
+**Trend-follow signal generator.**
+
+Signal logic:
+- **LONG**: EMA_fast > EMA_slow AND ADX >= 18 AND RSI >= 52
+- **SHORT**: EMA_fast < EMA_slow AND ADX >= 18 AND RSI <= 48
+- **NO_TRADE**: Filters not met (but watch levels provided)
+
+Returns `Signal` dataclass with:
+- `side`: LONG / SHORT / NO_TRADE
+- `entry`, `stop`, `target`: Price levels (ATR-based)
+- `metrics`: Dict with EMA, RSI, ADX, ATR values + watch info
+
+#### `regime.py`
+**Candle-driven regime classifier.**
+
+Labels:
+- **TREND**: High ADX + directional alignment across timeframes
+- **CHOP**: Low ADX + poor alignment
+- **VOLATILE**: High ATR% or high IV percentile
+
+Functions:
+- `timeframe_signature(df)`: Computes direction, ADX, ATR% for one timeframe
+- `alignment_gate(ltf, htf, dtf)`: Returns True if all timeframes agree on direction
+- `detect_regime(...)`: Returns `RegimeResult` with label + confidence (0-1)
+
+#### `strategy_engine.py`
+**Multi-leg strategy selector (Phase 3).**
+
+Selects structure based on:
+- Signal side (LONG/SHORT)
+- Regime (TREND/CHOP/VOLATILE)
+- IV percentile (high/low)
+- Signal strength
+
+Structures supported:
+| Action | Description |
+|--------|-------------|
+| `BUY_CE` / `BUY_PE` | Single-leg directional |
+| `BULL_CALL_SPREAD` | Buy ATM call, sell OTM call |
+| `BEAR_PUT_SPREAD` | Buy ATM put, sell OTM put |
+| `BULL_PUT_CREDIT` | Sell OTM put, buy further OTM put |
+| `BEAR_CALL_CREDIT` | Sell OTM call, buy further OTM call |
+| `IRON_CONDOR` | Bull put + bear call credit spreads |
+| `LONG_STRADDLE` | Buy ATM call + ATM put |
+| `LONG_STRANGLE` | Buy OTM call + OTM put |
+
+---
+
+### Greeks & IV
+
+#### `iv_greeks.py`
+**Black-Scholes IV solver and Greeks calculator.**
+
+Functions:
+- `implied_volatility(price, S, K, T, r, right)`: Bisection solver, returns `(iv, ok_flag)`
+- `greeks(S, K, T, r, iv, right)`: Returns dict with `delta`, `gamma`, `vega_1pct`, `theta_day`
+- `time_to_expiry_years(expiry)`: Converts expiry string to T in years
+
+Notes:
+- Theta is per calendar day (for risk caps)
+- Vega is per 1% IV move
+- Risk-free rate hardcoded at 6%
+
+#### `iv_store.py`
+**IV history storage and percentile calculation.**
+
+- Appends IV snapshots to `data/iv_history.csv`
+- Computes rolling IV percentile with EWMA smoothing
+- Returns percentile in [0, 1] range
+
+---
+
+### Risk Management
+
+#### `risk_caps.py`
+**Greeks-based position sizing.**
+
+Caps (per trade):
+| Cap | Default % of Capital |
+|-----|---------------------|
+| Premium | 8% (high) / 5% (moderate) |
+| Delta-notional | 100% |
+| Vega (1% IV move) | 2% |
+| Theta (daily) | 0.6% |
+
+Multipliers applied:
+- **Regime**: TREND (1.0x), VOLATILE (0.65-0.85x), CHOP (0.80-1.05x)
+- **Confidence**: High (1.0x), Low (0.70x)
+- **DTE**: <=1 (0.65x), 2 (0.75x), 3 (0.85x), 4+ (1.0x)
+
+Final lots = `min(by_premium, by_delta, by_vega, by_theta, max_lots_hard)`
+
+#### `portfolio.py`
+**Portfolio-level risk management (Phase 4).**
+
+Aggregate caps:
+| Cap | Default | Formula |
+|-----|---------|---------|
+| Premium at risk | 35% | sum(premium_at_risk) <= frac * capital |
+| Delta-notional | 60% | sum(\|net_delta\| * spot * contracts) <= frac * capital |
+| Vega | 60% | sum(\|vega_1pct\| * contracts) <= frac * capital / 1000 |
+| Gamma | 50% | sum(\|gamma\| * contracts) <= frac * capital / 1000 |
+| Theta | 80% | sum(\|theta_day\| * contracts) <= frac * capital / 1000 |
+| Positions per underlying | 2 | Hard count limit |
+| Positions per cluster | 4 | Hard count limit |
+
+Correlation cap (optional):
+- Computes correlation of daily returns between new position and existing portfolio
+- Rejects if max correlation > threshold (default 0.85)
+
+State file: `data/portfolio_state.json`
+Cluster mapping: `data/clusters.json`
+
+#### `correlation.py`
+**Correlation-based portfolio diversification.**
+
+- Fetches daily candles for underlyings
+- Computes pairwise correlation of close-to-close returns
+- Returns max correlation with existing portfolio positions
+- LRU cached for performance
+
+---
+
+### Data & Kite Integration
+
+#### `kite_client.py`
+**Authenticated Kite client with rate limiting.**
+
+Features:
+- Token bucket rate limiter (default: 3 RPS, burst 6)
+- Exponential backoff on 429 errors
+- Wrapper functions: `kite_quote_safe()`, `kite_ltp_safe()`, `kite_historical_safe()`, `kite_positions_safe()`
+
+#### `kite_chain.py`
+**Option chain slice builder.**
+
+- Loads NFO instruments (cached to CSV)
+- Picks expiry within DTE band
+- Fetches quotes for strikes around ATM
+- Returns `ChainSlice` with calls/puts DataFrames + spot/ATM
+
+#### `kite_login.py`
+**One-time token generator.**
+
+- Prints Kite login URL
+- Exchanges request_token for access_token
+- Writes to `.env` file
+
+#### `market_data.py`
+**Historical candle fetcher with caching.**
+
+- Maps interval strings to Kite format (e.g., `15m` -> `15minute`)
+- Fetches in safe chunks (respects Kite limits)
+- Caches to `data/candle_cache/` with TTL
+- Tracks cache hit/miss stats
+
+#### `quotes.py`
+**Quote caching layer (Phase 5).**
+
+- TTL-based cache (default 3 seconds)
+- Batch fetch with chunking
+- Normalizes bid/ask/mid/ltp/spread_pct
+
+---
+
+### Market Context
+
+#### `market_sentiment.py`
+**Market context snapshot builder.**
+
+Computes:
+- **VIX**: Level + 30-day percentile
+- **PCR**: Put-Call ratio from OI and volume
+- **Skew**: OTM put IV - OTM call IV (proxy)
+- **OI Walls**: Strikes with highest OI (support/resistance)
+- **Index Trend**: Direction using same signal logic
+
+Returns `MarketContext` with bias (BULLISH/BEARISH/NEUTRAL) and strength score.
+
+---
+
+### Output & Journaling
+
+#### `journal.py`
+**Append-only recommendation journal.**
+
+- Appends to `data/reco_history.csv` (never overwrites)
+- Writes per-run snapshots
+- Schema-stable output
+
+#### `trabot_schema.py`
+**Schema versioning for CSV stability (Phase 1).**
+
+- Defines 71 columns for reco rows
+- `normalize_row()` ensures all rows match schema
+- Unknown keys captured in `extra_json` column
+- Current schema version: 3
+
+#### `run_manifest.py`
+**Per-run reproducibility manifest (Phase 1).**
+
+Writes `data/runs/<run_id>/manifest.json` with:
+- All `TRABOT_*` environment variables
+- Config snapshot
+- Universe info
+- Runtime stats
+- Output file paths
+
+---
+
+### Analysis & Tuning
+
+#### `reco_analyzer_v22.py`
+**Recommendation evaluator (Phase 6).**
+
+- Fetches option candles for each reco
+- Simulates entry at first candle open after `ts_reco`
+- Tracks SL/target/time-stop hits
+- Computes MFE/MAE (max favorable/adverse excursion)
+- Reports: win rate, profit factor, Sharpe, Sortino, max drawdown
+- Loss attribution tags
+
+#### `walkforward_tuner.py`
+**Walk-forward parameter tuner (Phase 6).**
+
+- Reads evaluated CSV
+- Tests parameter combinations on rolling windows
+- Outputs `data/best_params.json` for scan-time overrides
+
+#### `execution.py`
+**Execution realism primitives (Phase 5).**
+
+Fill models:
+| Model | Penalty |
+|-------|---------|
+| `mid` / `optimistic` | 0% of spread |
+| `bid` / `ask` | 50% of spread |
+| `realistic` / `mid_k` | k% of spread (default k=0.25) |
+| `pessimistic` | 100% of spread |
+
+---
+
+### Utilities
+
+#### `io_utils.py`
+**Atomic file operations.**
+
+- `atomic_write_text()`: Write via temp file + rename
+- `atomic_write_json()`: JSON with atomic write
+- `append_csv_row()`: Schema-stable CSV append
+
+#### `logging_utils.py`
+**Structured JSON logging.**
+
+- JSON Lines format for production
+- Falls back to plain text if JSON fails
+- Configurable via `TRABOT_LOG_LEVEL` and `TRABOT_LOG_JSON`
+
+#### `stats.py`
+**Lightweight stats collector.**
+
+Tracks:
+- API calls, retries, 429 errors
+- API latency (sum, count, avg)
+- Cache hits/misses (candle, quote)
+
+#### `throttle.py`
+**Token bucket rate limiter.**
+
+- Used by `kite_client.py` for API rate limiting
+- Configurable rate and burst size
+
+#### `doctor.py`
+**Environment health check.**
+
+Checks:
+- Python version
+- Schema version
+- Required env vars (KITE_API_KEY, KITE_ACCESS_TOKEN)
+- Module imports
+
+---
+
+### Legacy/Support Modules
+
+| Module | Description |
+|--------|-------------|
+| `backtest.py` | Candle-based forward simulator |
+| `config.py` | Default configuration values |
+| `indicators.py` | EMA, RSI, ATR, ADX helpers |
+| `main.py` | Single-underlying demo runner |
+| `option_chain.py` | Backwards-compatible wrapper |
+| `patterns.py` | Pattern/setup idea generator |
+| `recommender.py` | Signal -> recommendation converter |
+| `reco_analyzer.py` | Legacy analyzer (use v22) |
+| `scan_options.py` | Legacy scanner (use v22) |
+| `scan_options_global.py` | Legacy global scanner |
+| `scan_options_global_v22.py` | Global scanner v22 |
+| `tuning.py` | Parameter tuning helpers |
+| `portfolio_kite.py` | Hydrate portfolio from Kite positions |
+
+---
+
+## Environment Variables
+
+### Kite API
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `KITE_API_KEY` | (required) | Kite Connect API key |
+| `KITE_ACCESS_TOKEN` | (required) | Daily access token |
+| `KITE_API_SECRET` | (for login) | API secret for token generation |
+
+### Rate Limiting
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TRABOT_KITE_RPS` | 3.0 | Requests per second limit |
+| `TRABOT_KITE_BURST` | 6 | Burst allowance |
+| `TRABOT_KITE_MAX_TRIES` | 6 | Max retry attempts |
+| `TRABOT_KITE_BACKOFF_BASE` | 0.8 | Backoff base (seconds) |
+| `TRABOT_QUOTE_TTL_SEC` | 3 | Quote cache TTL |
+| `TRABOT_CACHE_TTL_MIN` | 5 | Candle cache TTL (minutes) |
+
+### Scanner Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TRABOT_MODE` | intraday | Scanner mode (intraday/swing) |
+| `TRABOT_CAPITAL` | 100000 | Capital for sizing |
+| `TRABOT_RISK_PROFILE` | high | Risk profile (high/moderate) |
+| `LOOKBACK_DAYS` | 180 | Candle history lookback |
+| `INTERVAL` | day | Candle interval |
+| `UNIVERSE_START` | 0 | Universe slice start |
+| `UNIVERSE_COUNT` | (all) | Universe slice count |
+| `STRIKES_AROUND_ATM` | 12 | Strikes to fetch per side |
+
+### Signal Thresholds
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `EMA_FAST` | 20 | Fast EMA period |
+| `EMA_SLOW` | 50 | Slow EMA period |
+| `RSI_PERIOD` | 14 | RSI period |
+| `ADX_PERIOD` | 14 | ADX period |
+| `ADX_MIN` | 18 | Minimum ADX for signal |
+| `ATR_PERIOD` | 14 | ATR period |
+| `STOP_ATR_MULT` | 1.5 | Stop distance (ATR multiple) |
+| `TARGET_ATR_MULT` | 2.2 | Target distance (ATR multiple) |
+
+### Regime & Alignment
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TRABOT_REQUIRE_HTF_ALIGN` | 0 | Require HTF alignment (0/1) |
+| `TRABOT_SKIP_CHOP` | 0 | Skip CHOP regime (0/1) |
+| `TRABOT_BLOCK_LONG_PREMIUM_IVP` | 0.0 | Block long premium above IVP |
+| `ALIGN_MODE` | (auto) | Alignment mode (off/soft/hard) |
+
+### Portfolio Caps
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TRABOT_PORTFOLIO_ENABLE` | 0 | Enable portfolio caps (0/1) |
+| `TRABOT_PORTFOLIO_RESERVE` | 0 | Reserve positions during scan (0/1) |
+| `TRABOT_PORTFOLIO_STATE_PATH` | data/portfolio_state.json | State file path |
+| `TRABOT_PORTFOLIO_MAX_PREMIUM_FRAC` | 0.35 | Max premium at risk (fraction) |
+| `TRABOT_PORTFOLIO_MAX_DELTA_NOTIONAL_FRAC` | 0.60 | Max delta-notional (fraction) |
+| `TRABOT_PORTFOLIO_MAX_VEGA_FRAC` | 0.60 | Max vega exposure (fraction) |
+| `TRABOT_PORTFOLIO_MAX_GAMMA_FRAC` | 0.50 | Max gamma exposure (fraction) |
+| `TRABOT_PORTFOLIO_MAX_THETA_FRAC` | 0.80 | Max theta exposure (fraction) |
+| `TRABOT_PORTFOLIO_MAX_POS_PER_UNDERLYING` | 2 | Max positions per underlying |
+| `TRABOT_PORTFOLIO_MAX_POS_PER_CLUSTER` | 4 | Max positions per cluster |
+| `TRABOT_PORTFOLIO_CORR_ENABLE` | 0 | Enable correlation cap (0/1) |
+| `TRABOT_PORTFOLIO_MAX_CORR` | 0.85 | Max correlation threshold |
+| `TRABOT_PORTFOLIO_CORR_LOOKBACK_DAYS` | 120 | Correlation lookback |
+
+### Stop/Target Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TRABOT_SINGLE_LEG_SL_TGT_MODE` | premium | SL/target mode (premium/delta) |
+| `TRABOT_MAX_TARGET_MOVE_PCT` | 0.08 | Max target move (% of spot) |
+| `TRABOT_MAX_STOP_MOVE_PCT` | 0.04 | Max stop move (% of spot) |
+| `TRABOT_TGT_CAP_MULT` | 3.0 | Target cap (multiple of entry) |
+| `TRABOT_WIDTH_MAX_MOVE_PCT` | 0.03 | Max spread width (% of spot) |
+| `TIME_STOP_MIN` | 90 | Time stop (minutes, intraday) |
+
+### Deduplication
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TRABOT_DEDUP_COOLDOWN_MIN` | 30 | Cooldown between same reco (minutes) |
+
+### Logging
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TRABOT_LOG_LEVEL` | INFO | Log level |
+| `TRABOT_LOG_JSON` | 1 | JSON log format (0/1) |
+
+### Tuning
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TRABOT_APPLY_BEST_PARAMS` | 0 | Apply best_params.json (0/1) |
+| `TRABOT_BEST_PARAMS_PATH` | data/best_params.json | Best params file |
+
+---
+
+## Data Files
+
+### Outputs
+
+| Path | Description |
+|------|-------------|
+| `data/reco_history.csv` | Append-only recommendation journal |
+| `data/reco_latest_v22.csv` | Latest run recommendations |
+| `data/options_scan_results_v22.csv` | Full scan results |
+| `data/options_top10_v22.csv` | Top 10 recommendations |
+| `data/runs/<run_id>/manifest.json` | Run manifest with config snapshot |
+| `data/reco_evaluated_v22_latest.csv` | Evaluated recommendations |
+
+### State
+
+| Path | Description |
+|------|-------------|
+| `data/portfolio_state.json` | Portfolio position state |
+| `data/clusters.json` | Underlying -> cluster mapping |
+| `data/best_params.json` | Walk-forward tuned parameters |
+
+### Cache
+
+| Path | Description |
+|------|-------------|
+| `data/candle_cache/` | Cached historical candles |
+| `data/kite_instruments_NFO.csv` | Cached NFO instruments |
+| `data/kite_instruments_NSE.csv` | Cached NSE instruments |
+| `data/iv_history.csv` | IV snapshot history |
+| `data/market_sentiment_history.csv` | Market context history |
+
+---
+
+## Usage Examples
+
+### Basic Scan
+
+```bash
+# Intraday scan
+python scan_options_v22.py --mode intraday
+
+# Swing scan
+python scan_options_v22.py --mode swing
+```
+
+### With Portfolio Caps
+
+```bash
+export TRABOT_PORTFOLIO_ENABLE=1
+export TRABOT_PORTFOLIO_RESERVE=1
+export TRABOT_CAPITAL=500000
+python scan_options_v22.py
+```
+
+### With Correlation Check
+
+```bash
+export TRABOT_PORTFOLIO_ENABLE=1
+export TRABOT_PORTFOLIO_CORR_ENABLE=1
+export TRABOT_PORTFOLIO_MAX_CORR=0.80
+python scan_options_v22.py
+```
+
+### Skip CHOP Regime
+
+```bash
+export TRABOT_SKIP_CHOP=1
+python scan_options_v22.py
+```
+
+### Require HTF Alignment
+
+```bash
+export TRABOT_REQUIRE_HTF_ALIGN=1
+python scan_options_v22.py
+```
+
+### Analyze Recommendations
+
+```bash
+python reco_analyzer_v22.py
+
+# With realistic fills
 python reco_analyzer_v22.py --fill_model realistic --fill_k 0.25
 ```
 
-### Phase 6: Analyzer + tuning
-Analyzer summary includes:
-- Profit factor, Sharpe, Sortino, max drawdown
-- loss attribution tags (SPREAD_WIDE, MULTI_LEG, CREDIT_STRUCTURE, STALE_QUOTES, etc.)
+### Walk-Forward Tuning
 
-Walk-forward tuning on the analyzer output (no candle refetch):
 ```bash
 python walkforward_tuner.py --csv data/reco_evaluated_v22_latest.csv
 ```
-Outputs: `data/walkforward_report_latest.txt`
+
+---
+
+## License
+
+Educational use only. No warranty. Not financial advice.

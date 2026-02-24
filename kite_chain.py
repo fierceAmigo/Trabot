@@ -22,7 +22,8 @@ import datetime as dt
 
 import pandas as pd
 
-from kite_client import get_kite
+from kite_client import get_kite, kite_ltp_safe
+from quotes import get_quotes, quote_fields
 
 
 def _kite_call_with_backoff(fn, *args, **kwargs):
@@ -205,7 +206,7 @@ def get_kite_chain_slice(
     df_opt = df_opt[df_opt["expiry_norm"] == expiry_date].copy()
 
     # Spot from Kite
-    spot_payload = _kite_call_with_backoff(kite.ltp, [kite_spot_symbol])
+    spot_payload = kite_ltp_safe([kite_spot_symbol])
     spot = float(spot_payload[kite_spot_symbol]["last_price"])
 
     # Infer strike step if requested
@@ -243,22 +244,15 @@ def get_kite_chain_slice(
     df_opt["kite_symbol"] = "NFO:" + df_opt["tradingsymbol"].astype(str)
     symbols = df_opt["kite_symbol"].tolist()
 
-    # Quote options (batched)
-    quotes: dict = {}
-    for chunk in _batch(symbols, n=150):
-        q = _kite_call_with_backoff(kite.quote, chunk) or {}
-        quotes.update(q)
+    # Quote options (cached + batched)
+    quotes: dict = get_quotes(symbols)
 
     rows = []
     for sym in symbols:
         d = quotes.get(sym) or {}
-        depth = d.get("depth") or {}
-        buy0 = (depth.get("buy") or [{}])[0]
-        sell0 = (depth.get("sell") or [{}])[0]
-
-        bid = buy0.get("price")
-        ask = sell0.get("price")
-
+        qf = quote_fields(d)
+        bid = qf.get("bid")
+        ask = qf.get("ask")
         rows.append({
             "kite_symbol": sym,
             "last_price": d.get("last_price", None),

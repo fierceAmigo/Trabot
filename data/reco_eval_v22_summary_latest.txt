@@ -1,2 +1,0 @@
-Total rows read: 20
-Rows evaluated: 0

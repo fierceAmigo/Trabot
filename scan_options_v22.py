@@ -32,12 +32,24 @@ from datetime import datetime
 from typing import Optional, Tuple
 
 import pandas as pd
+import logging
+from logging_utils import init_logging
+from stats import snapshot as stats_snapshot
+from io_utils import atomic_write_text
+
 
 from trabot_schema import RECO_SCHEMA_VERSION, DEFAULT_HISTORY_PATH
 from run_manifest import write_manifest as write_run_manifest_v1, update_manifest as update_run_manifest_v1, env_snapshot, now_iso
 from regime import detect_regime
 from strategy_engine import decide_blueprint, Blueprint, LegSpec
-from portfolio import load_portfolio, save_portfolio, load_clusters, make_position_from_reco, check_portfolio_caps, maybe_reserve_position
+try:
+    from portfolio import load_portfolio, save_portfolio, load_clusters, make_position_from_reco, check_portfolio_caps, maybe_reserve_position
+    _PORTFOLIO_IMPORT_ERROR = ""
+except Exception as _e:
+    # Portfolio features are optional; scanner can run without them unless enabled.
+    load_portfolio = save_portfolio = load_clusters = make_position_from_reco = check_portfolio_caps = maybe_reserve_position = None
+    _PORTFOLIO_IMPORT_ERROR = str(_e)
+
 
 from kite_client import get_kite
 from kite_chain import get_kite_chain_slice
@@ -93,6 +105,8 @@ TRABOT_PORTFOLIO_MAX_GAMMA_FRAC = float(os.getenv("TRABOT_PORTFOLIO_MAX_GAMMA_FR
 TRABOT_PORTFOLIO_MAX_THETA_FRAC = float(os.getenv("TRABOT_PORTFOLIO_MAX_THETA_FRAC", "0.80"))
 TRABOT_PORTFOLIO_MAX_POS_PER_UNDERLYING = int(os.getenv("TRABOT_PORTFOLIO_MAX_POS_PER_UNDERLYING", "2"))
 TRABOT_PORTFOLIO_MAX_POS_PER_CLUSTER = int(os.getenv("TRABOT_PORTFOLIO_MAX_POS_PER_CLUSTER", "4"))
+TRABOT_PORTFOLIO_CORR_ENABLE = os.getenv("TRABOT_PORTFOLIO_CORR_ENABLE", "0").strip() == "1"
+TRABOT_PORTFOLIO_MAX_CORR = float(os.getenv("TRABOT_PORTFOLIO_MAX_CORR", "0.85"))
 TRABOT_DEDUP_COOLDOWN_MIN = int(os.getenv("TRABOT_DEDUP_COOLDOWN_MIN", "30"))
 TRABOT_WIDTH_MAX_MOVE_PCT = float(os.getenv("TRABOT_WIDTH_MAX_MOVE_PCT", "0.03"))
 
@@ -545,6 +559,7 @@ def _parse_ts_ist(x):
         if not s or s.lower() in ("nan","none","null"):
             return None
         import pandas as pd
+
         ts = pd.to_datetime(s, errors="coerce")
         if ts is pd.NaT:
             return None
@@ -791,11 +806,6 @@ def _anchor_leg_index(blueprint: Blueprint, legs: list[dict]) -> int:
         if lg.get("side") == "BUY":
             return i
     return 0
-    if TRABOT_PORTFOLIO_ENABLE and TRABOT_PORTFOLIO_RESERVE:
-        try:
-            save_portfolio(PORTFOLIO_STATE, TRABOT_PORTFOLIO_STATE_PATH)
-        except Exception:
-            pass
 
 
 
@@ -902,8 +912,8 @@ def _build_candidate(item: dict, lot_map: dict, market_ctx: MarketContext | None
         else:
             return None
 
-    last_ts = pd.Timestamp(df.index[-1])
-    sess = _session_tag(last_ts)
+    candle_ts = pd.Timestamp(df.index[-1])
+    sess = _session_tag(candle_ts)
     sess_factor = _session_factor(sess)
 
     bos_tag, bos_strength = _bos_strength(df, lookback=20)
@@ -1204,14 +1214,18 @@ def _build_candidate(item: dict, lot_map: dict, market_ctx: MarketContext | None
     final_lots = int(min(int(max_lots), int(risk_lots))) if risk_lots > 0 else int(max_lots)
     pass_caps = bool(final_lots >= 1)
 
+    # Phase-3 metadata (computed early for portfolio caps)
+    legs_json = json.dumps(legs, separators=(",", ":"), ensure_ascii=False, default=_json_default)
+
     # Phase-4: portfolio caps (optional)
-    if TRABOT_PORTFOLIO_ENABLE and final_lots >= 1:
+    if TRABOT_PORTFOLIO_ENABLE and final_lots >= 1 and make_position_from_reco is not None:
         global PORTFOLIO_STATE, CLUSTERS_MAP
         try:
             underlying_u = str(item.get("underlying") or "").upper()
             _tmp = {
                 "ts_reco": ts_reco,
                 "underlying": underlying_u,
+                "spot_symbol": item.get("spot", ""),
                 "expiry": str(chain.expiry),
                 "strategy_type": plan_action,
                 "legs_json": legs_json,
@@ -1234,6 +1248,8 @@ def _build_candidate(item: dict, lot_map: dict, market_ctx: MarketContext | None
                 max_theta_frac=float(TRABOT_PORTFOLIO_MAX_THETA_FRAC),
                 max_pos_per_underlying=int(TRABOT_PORTFOLIO_MAX_POS_PER_UNDERLYING),
                 max_pos_per_cluster=int(TRABOT_PORTFOLIO_MAX_POS_PER_CLUSTER),
+                corr_enable=TRABOT_PORTFOLIO_CORR_ENABLE,
+                max_corr=float(TRABOT_PORTFOLIO_MAX_CORR),
             )
             if not ok:
                 return None
@@ -1254,8 +1270,6 @@ def _build_candidate(item: dict, lot_map: dict, market_ctx: MarketContext | None
         pass
     notes_str = " | ".join(notes)
 
-    # Phase-3 metadata
-    legs_json = json.dumps(legs, separators=(",", ":"), ensure_ascii=False, default=_json_default)
     # Quote latency (best-effort)
     try:
         now_ist = pd.Timestamp.now(tz="Asia/Kolkata")
@@ -1301,7 +1315,7 @@ def _build_candidate(item: dict, lot_map: dict, market_ctx: MarketContext | None
 
     return {
         "underlying": item["underlying"],
-        "ts_signal": str(last_ts),
+        "ts_signal": str(candle_ts),
         "spot_symbol": item["spot"],
         "expiry": chain.expiry,
         "action": plan_action,
@@ -1472,12 +1486,31 @@ def _print_top10_min(title: str, rows: list[dict]):
 
 
 def main(mode: str = "intraday"):
+    try:
+        init_logging()
+    except Exception:
+        pass
+    log = logging.getLogger("trabot.scan")
     run_ts = datetime.now()
     ts_str = run_ts.isoformat(timespec="seconds")
     run_id = make_run_id(run_ts)
+    best_params = {}
+    if globals().get("TRABOT_APPLY_BEST_PARAMS", False):
+        try:
+            _bp = str(globals().get("TRABOT_BEST_PARAMS_PATH", "data/best_params.json"))
+            if os.path.exists(_bp):
+                best_params = json.loads(open(_bp,'r',encoding='utf-8').read() or '{}')
+        except Exception:
+            best_params = {}
     global PORTFOLIO_STATE, CLUSTERS_MAP, COOLDOWN_LAST_TS
-    CLUSTERS_MAP = load_clusters("data/clusters.json")
-    PORTFOLIO_STATE = load_portfolio(TRABOT_PORTFOLIO_STATE_PATH)
+    if TRABOT_PORTFOLIO_ENABLE:
+        if _PORTFOLIO_IMPORT_ERROR:
+            raise RuntimeError("Portfolio enabled but portfolio.py failed to import: " + _PORTFOLIO_IMPORT_ERROR)
+        CLUSTERS_MAP = load_clusters("data/clusters.json")
+        PORTFOLIO_STATE = load_portfolio(TRABOT_PORTFOLIO_STATE_PATH)
+    else:
+        CLUSTERS_MAP = {}
+        PORTFOLIO_STATE = None
     # load recent signatures for cooldown (best-effort)
     try:
         hist_path = os.getenv("TRABOT_RECO_HISTORY", DEFAULT_RECO_HISTORY_PATH)
@@ -1628,6 +1661,11 @@ def main(mode: str = "intraday"):
         },
         "market_ctx": (market_ctx.__dict__ if market_ctx else None),
         "outputs": {},
+        "runtime": {
+            "python": sys.version.split()[0],
+            "platform": platform.platform(),
+        },
+        "stats": {},
     }
     manifest_path = write_run_manifest(run_id, manifest)
 
@@ -1671,8 +1709,16 @@ def main(mode: str = "intraday"):
 
     # Full scan results (latest + snapshot)
     df_all = pd.DataFrame(cands)
-    df_all.to_csv(f"data/options_scan_results_v22{suffix}.csv", index=False)
-    df_all.to_csv(f"data/options_scan_results_v22_{run_id}.csv", index=False)
+
+    # Phase-1: schema-stable scan outputs
+    SCAN_RESULTS_COLUMNS = sorted(list(df_all.columns))
+    def _stable(df, cols):
+        for c in cols:
+            if c not in df.columns:
+                df[c] = ""
+        return df.reindex(columns=cols)
+    atomic_write_text(f"data/options_scan_results_v22{suffix}.csv", _stable(df_all, SCAN_RESULTS_COLUMNS).to_csv(index=False))
+    atomic_write_text(f"data/options_scan_results_v22_{run_id}.csv", _stable(df_all, SCAN_RESULTS_COLUMNS).to_csv(index=False))
 
     # Top10 minimal file (latest + snapshot)
     df_top10_min = pd.DataFrame([{
@@ -1683,8 +1729,10 @@ def main(mode: str = "intraday"):
         "sl": c["sl"],
         "target": c["target"],
     } for c in top10])
-    df_top10_min.to_csv(f"data/options_top10_v22{suffix}.csv", index=False)
-    df_top10_min.to_csv(f"data/options_top10_v22_{run_id}.csv", index=False)
+    TOP10_COLUMNS = sorted(list(df_top10_min.columns)) if "TOP10_COLUMNS" not in locals() else TOP10_COLUMNS
+    atomic_write_text(f"data/options_top10_v22{suffix}.csv", _stable(df_top10_min, TOP10_COLUMNS).to_csv(index=False))
+    TOP10_COLUMNS = sorted(list(df_top10_min.columns)) if "TOP10_COLUMNS" not in locals() else TOP10_COLUMNS
+    atomic_write_text(f"data/options_top10_v22_{run_id}.csv", _stable(df_top10_min, TOP10_COLUMNS).to_csv(index=False))
 
     # Combined reco snapshot (top2+top10)
     reco_rows = []

@@ -27,9 +27,12 @@ from typing import Optional, Tuple, List, Dict
 
 import pandas as pd
 
+from io_utils import atomic_write_text
+from execution import FillConfig, entry_fill, exit_fill, exec_extrema
+
 from trabot_schema import DEFAULT_HISTORY_PATH as DEFAULT_RECO_HISTORY_PATH, RECO_SCHEMA_VERSION
 
-from kite_client import get_kite
+from kite_client import get_kite, kite_historical_safe
 from iv_greeks import implied_volatility
 
 IST = "Asia/Kolkata"
@@ -211,7 +214,7 @@ def _write_cache(path: str, df: pd.DataFrame) -> None:
     _ensure_dir(os.path.dirname(path))
     out = ensure_index_ist(df.copy())
     out.index.name = "Datetime"
-    out.to_csv(path, index=True)
+    atomic_write_text(path, out.to_csv(index=True))
 
 
 def _load_or_fetch_nfo_instruments() -> pd.DataFrame:
@@ -242,7 +245,7 @@ def _chunked_historical(kite, token: int, start: dt.datetime, end: dt.datetime, 
     out: List[dict] = []
     while cur < end:
         cur_end = min(end, cur + dt.timedelta(days=max_days))
-        rows = kite.historical_data(token, cur, cur_end, interval, continuous=False, oi=False) or []
+        rows = kite_historical_safe(token, cur, cur_end, interval, continuous=False, oi=False) or []
         out.extend(rows)
         cur = cur_end + dt.timedelta(seconds=1)
     return out
@@ -310,16 +313,12 @@ def evaluate_path_with_mfe_mae(
     fill_model: str = "realistic",
     fill_k: float = 0.25,
 ):
-    """
-    Evaluate a single recommendation on option candles.
+    """Evaluate a single recommendation on candles with an execution model.
 
-    Execution model (phase-5 baseline):
-      - mid / optimistic: no penalty (k_eff=0)
-      - mid_k / realistic: k_eff = fill_k (default 0.25)
-      - bid / ask: half-spread penalty (k_eff=0.5)
-      - pessimistic: full-spread penalty (k_eff=1)
-
-    Note: We still use candle HIGH/LOW for SL/Target hit detection (no bid/ask candle series).
+    Improvements (Phase-5):
+    - entry/exit fill penalty via execution.py
+    - executable extrema for trigger detection (hi_exec/lo_exec)
+    - supports debit and credit values (synthetic multi-leg can be negative)
     """
     if opt_df is None or opt_df.empty:
         return {"status": "NO_CANDLES"}
@@ -332,111 +331,75 @@ def evaluate_path_with_mfe_mae(
         return {"status": "NO_CANDLES_AFTER_RECO"}
 
     entry_ts = after.index[0]
-    entry_px_raw = float(after.iloc[0]["open"])
-    # Allow negative entry/levels (credit structures). Validate ordering.
-    if not (entry_px_raw == entry_px_raw) or abs(entry_px_raw) <= 1e-9:
-        return {"status": "BAD_LEVELS"}
+    entry_raw = float(after.iloc[0]["open"])
+
     try:
         sl_f = float(sl)
         tgt_f = float(target)
     except Exception:
         return {"status": "BAD_LEVELS"}
-    # Ensure sl < target
-    if sl_f > tgt_f:
-        sl_f, tgt_f = tgt_f, sl_f
-    sl = sl_f
-    target = tgt_f
-    # If entry lies outside [sl,target], still proceed but metrics may be less meaningful.
 
-    sp = float(spread_pct or 0.0)
-    sp = max(0.0, min(sp, 0.80))
-    fm = (fill_model or "realistic").strip().lower()
-    if fm in ("mid", "optimistic"):
-        k_eff = 0.0
-    elif fm in ("pessimistic",):
-        k_eff = 1.0
-    elif fm in ("bid", "ask"):
-        k_eff = 0.5
-    else:  # realistic / mid_k
-        k_eff = float(fill_k)
-    k_eff = max(0.0, min(float(k_eff), 1.0))
+    # ensure ordering
+    lo_lvl, hi_lvl = (sl_f, tgt_f) if sl_f <= tgt_f else (tgt_f, sl_f)
 
-    # Fill penalty in value space (works for debit and credit):
-    # entry worsens toward 0 by k*spread*abs(entry)
-    entry_px = float(entry_px_raw) + (k_eff * sp * abs(float(entry_px_raw)))
+    cfg = FillConfig(model=fill_model, k=float(fill_k), spread_pct=float(spread_pct or 0.0))
+    entry_px = entry_fill(entry_raw, cfg)
 
-    # MFE/MAE measured from entry until exit (using raw candle extrema vs fill-adjusted entry)
     max_fav = 0.0
     max_adv = 0.0
     exit_ts = None
-    exit_px_raw = None
+    exit_raw = None
     hit = "TIME_EXIT"
 
     for idx, row in after.iterrows():
         hi = float(row["high"])
         lo = float(row["low"])
+        hi_exec, lo_exec = exec_extrema(hi, lo, cfg)
 
-        max_fav = max(max_fav, hi - entry_px)
-        max_adv = min(max_adv, lo - entry_px)  # negative
+        max_fav = max(max_fav, hi_exec - entry_px)
+        max_adv = min(max_adv, lo_exec - entry_px)
 
-        # SL/Target hit check (raw candle levels)
-        if lo <= sl:
+        # Trigger detection on executable extrema
+        if lo_exec <= lo_lvl:
             hit = "STOP"
             exit_ts = idx
-            exit_px_raw = float(sl)
+            exit_raw = float(lo_lvl)
             break
-        if hi >= target:
+        if hi_exec >= hi_lvl:
             hit = "TARGET"
             exit_ts = idx
-            exit_px_raw = float(target)
+            exit_raw = float(hi_lvl)
             break
 
     if exit_ts is None:
         exit_ts = after.index[-1]
-        exit_px_raw = float(after.iloc[-1]["close"])
+        exit_raw = float(after.iloc[-1]["close"])
 
-    # Exit worsens against the trader by k*spread*abs(exit)
-    exit_px = float(exit_px_raw) - (k_eff * sp * abs(float(exit_px_raw)))
+    exit_px = exit_fill(exit_raw, cfg)
 
     pnl = exit_px - entry_px
-    pnl_pct = pnl / entry_px if entry_px > 0 else 0.0
+    dur_min = (exit_ts - entry_ts).total_seconds() / 60.0
 
-    bars_to_exit = int(after.index.get_loc(exit_ts)) + 1
-
-    # Fractions
-    target_dist = max(1e-9, float(target) - float(entry_px_raw))
-    mfe_frac = max_fav / target_dist if target_dist > 0 else 0.0
-
-    sl_dist = max(1e-9, float(entry_px_raw) - float(sl))
-    mae_frac = abs(max_adv) / sl_dist if sl_dist > 0 else 0.0
+    # Fractions for reporting
+    rng = (hi_lvl - lo_lvl) if (hi_lvl - lo_lvl) != 0 else None
+    tgt_frac = ((hi_lvl - entry_px) / rng) if rng else None
+    sl_frac = ((entry_px - lo_lvl) / rng) if rng else None
 
     return {
         "status": "OK",
-        "hit": hit,
         "entry_ts": entry_ts,
         "exit_ts": exit_ts,
         "entry_px": entry_px,
-        "entry_px_raw": entry_px_raw,
         "exit_px": exit_px,
-        "exit_px_raw": float(exit_px_raw),
         "pnl": pnl,
-        "pnl_pct": pnl_pct,
-        "bars_to_exit": bars_to_exit,
+        "hit": hit,
         "mfe": max_fav,
         "mae": max_adv,
-        "mfe_frac_to_target": mfe_frac,
-        "mae_frac_to_sl": mae_frac,
-        "fill_model": fm,
-        "fill_k": k_eff,
-        "spread_pct_used": sp,
+        "dur_min": dur_min,
+        "tgt_frac": tgt_frac,
+        "sl_frac": sl_frac,
     }
 
-
-
-
-# ----------------------------
-# Phase-3: multi-leg evaluation
-# ----------------------------
 
 def parse_legs_json(s: str) -> list[dict]:
     """Parse legs_json written by scanner. Returns [] if missing/bad."""
@@ -940,8 +903,8 @@ def main():
 
     latest_csv = os.path.join(DATA_DIR, "reco_evaluated_v22_latest.csv")
     snap_csv = os.path.join(DATA_DIR, f"reco_evaluated_v22_{run_id}.csv")
-    out_df.to_csv(latest_csv, index=False)
-    out_df.to_csv(snap_csv, index=False)
+    atomic_write_text(latest_csv, out_df.to_csv(index=False))
+    atomic_write_text(snap_csv, out_df.to_csv(index=False))
 
     summary = summarize(out_df)
     latest_txt = os.path.join(DATA_DIR, "reco_eval_v22_summary_latest.txt")

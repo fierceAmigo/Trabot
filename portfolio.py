@@ -37,7 +37,8 @@ Caps (env):
 - TRABOT_PORTFOLIO_MAX_PREMIUM_FRAC=0.35   (sum premium_at_risk <= frac * capital)
 - TRABOT_PORTFOLIO_MAX_DELTA_NOTIONAL_FRAC=0.60  (|net_delta|*spot*contracts <= frac*capital)
 - TRABOT_PORTFOLIO_MAX_VEGA_FRAC=0.60      (sum |vega_1pct|*contracts <= frac*capital/1000)
-- TRABOT_PORTFOLIO_MAX_GAMMA_FRAC=0.50     (sum |gamma|*contracts <= frac*capital/10000)
+- TRABOT_PORTFOLIO_MAX_GAMMA_FRAC=0.50     (sum |gamma|*contracts <= frac*capital/1000)
+- TRABOT_PORTFOLIO_MAX_THETA_FRAC=0.80     (sum |theta_day|*contracts <= frac*capital/1000)
 - TRABOT_PORTFOLIO_MAX_POS_PER_UNDERLYING=2
 - TRABOT_PORTFOLIO_MAX_POS_PER_CLUSTER=4
 
@@ -55,6 +56,9 @@ import os
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timezone
+
+from correlation import max_corr_with_portfolio, MAX_CORR
+from portfolio_kite import hydrate_from_kite
 
 try:
     from dateutil import tz
@@ -85,7 +89,10 @@ class Position:
     legs: List[Leg]
     lots: int
     lot_size: int
+    spot_symbol: str = ""
+    expiry: str = ""
     premium_at_risk: float = 0.0
+
 
 
 @dataclass
@@ -244,6 +251,8 @@ def make_position_from_reco(
     clusters: Dict[str, str],
 ) -> Position:
     underlying = str(reco_row.get("underlying") or "").upper()
+    spot_symbol = str(reco_row.get("spot_symbol") or "")
+    expiry = str(reco_row.get("expiry") or "")
     cluster = clusters.get(underlying, "DEFAULT")
     legs = []
     try:
@@ -303,6 +312,8 @@ def make_position_from_reco(
         legs=legs,
         lots=lots,
         lot_size=lot_size,
+        spot_symbol=spot_symbol,
+        expiry=expiry,
         premium_at_risk=float(prem_risk),
     )
 
@@ -320,8 +331,14 @@ def check_portfolio_caps(
     max_theta_frac: float,
     max_pos_per_underlying: int,
     max_pos_per_cluster: int,
+    corr_enable: bool = False,
+    max_corr: float = 0.85,
 ) -> Tuple[bool, str]:
-    """Return (ok, reason)."""
+    """Return (ok, reason).
+
+    If corr_enable=True, checks correlation of new position's underlying
+    against existing portfolio underlyings. Rejects if max correlation > max_corr.
+    """
     if capital <= 0:
         return True, "CAPITAL_UNKNOWN"
 
@@ -331,7 +348,26 @@ def check_portfolio_caps(
     if by_cluster.get(new_pos.cluster, 0) >= int(max_pos_per_cluster):
         return False, "PORTFOLIO_CAP_CLUSTER_COUNT"
 
-    # aggregate including new
+    # Correlation check (optional)
+    if corr_enable:
+        try:
+            # Get spot symbols from existing open positions
+            portfolio_symbols = []
+            for p in state.positions:
+                if p.status == "OPEN" and p.spot_symbol:
+                    portfolio_symbols.append(p.spot_symbol)
+
+            if portfolio_symbols and new_pos.spot_symbol:
+                corr_val, corr_with = max_corr_with_portfolio(
+                    new_pos.spot_symbol,
+                    portfolio_symbols
+                )
+                if corr_val is not None and abs(corr_val) > max_corr:
+                    return False, f"PORTFOLIO_CAP_CORRELATION({corr_with}:{corr_val:.2f})"
+        except Exception:
+            pass  # Correlation check is best-effort
+
+    # Aggregate including new position
     temp = PortfolioState(asof=state.asof, positions=state.positions + [new_pos])
     exp = aggregate_exposures(temp, spot_by_underlying={new_pos.underlying: float(spot)})
 
@@ -339,7 +375,7 @@ def check_portfolio_caps(
         return False, "PORTFOLIO_CAP_PREMIUM"
     if exp["delta_notional"] > float(max_delta_notional_frac) * capital:
         return False, "PORTFOLIO_CAP_DELTA"
-        # vega/gamma/theta are scaled; these are rough heuristics
+    # vega/gamma/theta are scaled; these are rough heuristics
     if exp["vega_1pct_total"] > float(max_vega_frac) * (capital / 1000.0):
         return False, "PORTFOLIO_CAP_VEGA"
     if exp["gamma_total"] > float(max_gamma_frac) * (capital / 1000.0):

@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
+from io_utils import atomic_write_text, append_csv_row
 from trabot_schema import DEFAULT_HISTORY_PATH, RECO_COLUMNS, normalize_rows
 
 
@@ -95,5 +96,5 @@ def save_snapshot(
     norm_rows = normalize_rows(rows, columns=cols)
 
     df = pd.DataFrame(norm_rows).reindex(columns=cols)
-    df.to_csv(path, index=False)
+    atomic_write_text(path, df.to_csv(index=False))
     return path

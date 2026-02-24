@@ -19,7 +19,9 @@ from typing import List, Tuple
 
 import pandas as pd
 
-from kite_client import get_kite
+from kite_client import get_kite, kite_historical_safe
+from io_utils import atomic_write_text
+from stats import inc
 
 
 # Cache for NSE instruments (fallback if ltp() doesn't return instrument_token)
@@ -191,11 +193,11 @@ def _fetch_historical_chunked(token: int, start: dt.datetime, end: dt.datetime, 
         last_err: Exception | None = None
         for i in range(6):
             try:
-                rows = kite.historical_data(
-                    instrument_token=token,
-                    from_date=cur,
-                    to_date=cur_end,
-                    interval=kite_interval,
+                rows = kite_historical_safe(
+                    token,
+                    cur,
+                    cur_end,
+                    kite_interval,
                     continuous=False,
                     oi=False,
                 ) or []
@@ -294,6 +296,7 @@ def fetch_history_cached(
             age_min = (time.time() - os.path.getmtime(fp)) / 60.0
             if ttl_minutes is None or age_min <= float(ttl_minutes):
                 cached = _read_cache(fp)
+                inc("candle_cache_hits", 1)
                 if not cached.empty:
                     end = dt.datetime.now()
                     start_need = end - dt.timedelta(days=int(lookback_days))
@@ -318,3 +321,9 @@ def fetch_history_cached(
         pass
 
     return df, used_interval
+
+
+def fetch_candles_for_symbol(kite_symbol: str, *, interval: str = "day", lookback_days: int = 120):
+    """Convenience wrapper for correlation module."""
+    df, _ = fetch_history_cached(kite_symbol, lookback_days=lookback_days, interval=interval, ttl_minutes=DEFAULT_CACHE_TTL_MIN)
+    return df

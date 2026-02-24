@@ -20,7 +20,11 @@ from __future__ import annotations
 import argparse
 import itertools
 import os
+import json
+from collections import Counter, defaultdict
 import pandas as pd
+
+from io_utils import atomic_write_json, atomic_write_text
 
 from tuning import apply_filters, compute_metrics
 
@@ -30,7 +34,7 @@ def score_fn(m):
     pf = m.profit_factor if m.profit_factor == m.profit_factor else 0.0
     dd = abs(m.max_drawdown)
     n = m.n
-    if n < 20:
+    if n < int(args.min_trades):
         return -1e9
     return pf - 2.0 * dd
 
@@ -41,6 +45,9 @@ def main():
     ap.add_argument("--train_days", type=int, default=60)
     ap.add_argument("--test_days", type=int, default=20)
     ap.add_argument("--step_days", type=int, default=20)
+    ap.add_argument("--min_trades", type=int, default=25)
+    ap.add_argument("--out_best", default="data/best_params.json")
+    ap.add_argument("--out_report_json", default="data/walkforward_report_latest.json")
     args = ap.parse_args()
 
     df = pd.read_csv(args.csv)
@@ -49,6 +56,10 @@ def main():
 
     df["ts_reco"] = pd.to_datetime(df["ts_reco"], errors="coerce")
     df = df.dropna(subset=["ts_reco"]).sort_values("ts_reco")
+
+    chosen_params = []
+    oos_scores = []
+    param_oos = defaultdict(list)
 
     # parameter grid (keep small to avoid overfitting)
     grid = {
