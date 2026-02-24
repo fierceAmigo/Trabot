@@ -64,7 +64,7 @@ python scan_options_v22.py --mode swing
 
 ## Architecture
 
-Trabot is organized into 6 phases, each adding capabilities:
+Trabot is organized into phases, each adding capabilities:
 
 ```
 Phase 1: Data Integrity          Phase 2: Regime Detection
@@ -88,6 +88,16 @@ Phase 5: Execution Realism
 | quotes.py             |        | reco_analyzer_v22.py  |
 | throttle.py           |        | walkforward_tuner.py  |
 | kite_client.py        |        | tuning.py             |
++-----------------------+        +-----------------------+
+
+P0-P3: Advanced Risk & Trading Intelligence
++-----------------------+        +-----------------------+
+| circuit_breaker.py    |        | expected_move.py      |
+| event_calendar.py     |        | iv_term_structure.py  |
+| session_manager.py    |        | probability_analysis.py|
++-----------------------+        +-----------------------+
+| greeks_monitor.py     |        | threshold_optimizer.py|
+| adjustment_engine.py  |        | liquidity_model.py    |
 +-----------------------+        +-----------------------+
 ```
 
@@ -421,6 +431,160 @@ Checks:
 
 ---
 
+### P0-P3: Advanced Risk & Trading Intelligence
+
+#### `circuit_breaker.py` (P0)
+**Daily loss limit and circuit breaker for capital protection.**
+
+States:
+- `ACTIVE`: Normal trading allowed
+- `WARNING_50/70/90`: Approaching limit
+- `TRIPPED`: Limit exceeded, no new entries
+
+Features:
+- Tracks realized + unrealized P&L
+- Auto-resets at market open (9:15 IST)
+- Consecutive loss tracking
+- Persists state to JSON
+
+Functions:
+- `check_circuit_breaker(capital)`: Returns `(ok, status, reason)`
+- `record_trade_result(trade_id, pnl)`: Record closed trade
+- `get_remaining_risk_budget(capital)`: Remaining risk budget
+
+#### `event_calendar.py` (P0)
+**Event calendar for avoiding earnings, RBI policy, and expiry events.**
+
+Event Types:
+- `EARNINGS`: Company quarterly results
+- `RBI_POLICY`: RBI monetary policy announcements
+- `MONTHLY_EXPIRY`: Last Thursday of month
+- `WEEKLY_EXPIRY`: Thursday weekly expiry
+- `BUDGET`: Union budget day
+
+Functions:
+- `should_avoid_entry(underlying, dte)`: Returns `(avoid, reason)`
+- `position_spans_event(underlying, entry_date, dte)`: Check for conflicts
+- `get_upcoming_events(days_ahead)`: List upcoming events
+
+#### `session_manager.py` (P1)
+**Session-aware trading rules for Indian markets.**
+
+Sessions (IST):
+- `OPENING` (9:15-10:00): High volatility, scalps only
+- `MORNING` (10:00-12:00): Best for trend entries
+- `LUNCH` (12:00-13:30): Low volume, avoid entries
+- `AFTERNOON` (13:30-14:30): Moderate, selective entries
+- `CLOSING` (14:30-15:30): Strong momentum only
+
+Functions:
+- `should_allow_entry(signal_strength, strategy_type)`: Returns `(allowed, reason)`
+- `get_adjusted_levels(entry, stop, target)`: Session-adjusted levels
+- `get_size_multiplier()`: Position size multiplier
+
+#### `expected_move.py` (P1)
+**Expected move calculation for spread width selection.**
+
+Formula: `EM = Spot × IV × sqrt(DTE/365) × Z-score`
+
+Z-scores:
+- 68% (1 std): 1.00
+- 80%: 1.28
+- 90%: 1.64
+- 95% (2 std): 1.96
+
+Functions:
+- `calculate_expected_move(spot, iv, dte, confidence)`: Returns `ExpectedMoveResult`
+- `suggest_spread_width(expected_move, step, strategy_type)`: Optimal width
+- `get_credit_spread_strikes(spot, iv, dte, side, step)`: Strike selection
+
+#### `iv_term_structure.py` (P1)
+**IV term structure analysis for strategy selection.**
+
+Structure Types:
+- `CONTANGO`: Near IV < Far IV (normal, favor front-month selling)
+- `BACKWARDATION`: Near IV > Far IV (avoid calendars)
+- `FLAT`: Neutral
+
+Functions:
+- `analyze_term_structure(underlying, options_data, spot)`: Returns `TermStructureResult`
+- `get_term_structure_bias(ts_result)`: Returns `(bias, adjustment_factor)`
+- `get_optimal_expiry(ts_result, side, default_dte)`: Optimal DTE
+
+#### `greeks_monitor.py` (P2)
+**Greeks-based position monitoring and stop loss management.**
+
+Stop Types:
+- `DELTA_BREACH`: Position too directional
+- `THETA_BREACH`: Excessive daily decay
+- `VEGA_BREACH`: IV move against position
+- `GAMMA_BREACH`: Near-expiry risk
+
+Functions:
+- `check_greeks_stops(position, spot, thresholds)`: Returns `GreeksStopResult`
+- `get_greeks_health_score(position)`: 0-1 health score
+- `suggest_adjustment(position, stop_result)`: Adjustment suggestions
+
+#### `probability_analysis.py` (P2)
+**Probability of Profit (POP) and Expected Value calculations.**
+
+Methods:
+- Delta-approximated (quick)
+- Log-normal distribution (accurate)
+
+Functions:
+- `calculate_pop(params)`: Probability of profit
+- `expected_value(pop, max_profit, max_loss)`: E[V] calculation
+- `analyze_trade_probability(params, max_profit, max_loss)`: Full analysis
+- `meets_probability_filters(result, min_pop, min_ev)`: Filter check
+
+#### `adjustment_engine.py` (P2)
+**Simplified adjustment framework for options positions.**
+
+Adjustment Types:
+- `ROLL_OUT`: Same strike, later expiry
+- `ROLL_UP/DOWN`: Different strike
+- `CONVERT_TO_SPREAD`: Add leg to define risk
+- `ADD_HEDGE`: Protective leg
+- `CLOSE_PARTIAL/FULL`: Exit position
+
+Functions:
+- `suggest_adjustments(position, max_loss, stop_loss)`: List of suggestions
+- `classify_position_status(position, max_loss)`: Status classification
+- `should_auto_adjust(position, max_loss)`: Auto-adjustment trigger
+
+#### `threshold_optimizer.py` (P3)
+**Walk-forward threshold calibration for adaptive tuning.**
+
+Features:
+- Rolling window optimization
+- Parameter grid search
+- Performance metrics: Sharpe, win rate, profit factor
+
+Functions:
+- `optimize_thresholds(trades, param_grid, lookback_days)`: Find best params
+- `load_best_params()`: Load from JSON
+- `walk_forward_optimize(trades, train_days, test_days)`: Full walk-forward
+
+#### `liquidity_model.py` (P3)
+**Advanced liquidity scoring for options selection.**
+
+Factors (weighted):
+- Bid-ask spread (30%)
+- Order book depth (20%)
+- Volume (20%)
+- Open interest (20%)
+- OI trend (10%)
+
+Grades: A (Excellent) → F (Avoid)
+
+Functions:
+- `calculate_liquidity_score(metrics)`: Returns `LiquidityScore`
+- `estimate_slippage(contracts, metrics)`: Slippage estimate
+- `filter_by_liquidity(options, min_score)`: Filter options
+
+---
+
 ### Legacy/Support Modules
 
 | Module | Description |
@@ -546,6 +710,85 @@ Checks:
 | `TRABOT_APPLY_BEST_PARAMS` | 0 | Apply best_params.json (0/1) |
 | `TRABOT_BEST_PARAMS_PATH` | data/best_params.json | Best params file |
 
+### P0: Circuit Breaker
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TRABOT_CIRCUIT_BREAKER_ENABLE` | 1 | Enable circuit breaker (0/1) |
+| `TRABOT_MAX_DAILY_LOSS_PCT` | 2.0 | Max daily loss as % of capital |
+| `TRABOT_MAX_CONSECUTIVE_LOSSES` | 5 | Max consecutive losses before trip |
+| `TRABOT_CIRCUIT_BREAKER_STATE_PATH` | data/circuit_breaker_state.json | State file |
+
+### P0: Event Calendar
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TRABOT_EVENT_CHECK_ENABLE` | 1 | Enable event calendar check (0/1) |
+| `TRABOT_EVENT_EARNINGS_BUFFER_HRS` | 24 | Buffer hours for earnings |
+| `TRABOT_EVENT_RBI_BUFFER_HRS` | 12 | Buffer hours for RBI policy |
+| `TRABOT_EVENT_EXPIRY_BUFFER_HRS` | 4 | Buffer hours before expiry |
+| `TRABOT_EVENTS_FILE` | data/events.json | Events data file |
+
+### P1: Session Manager
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TRABOT_SESSION_RULES_ENABLE` | 1 | Enable session rules (0/1) |
+| `TRABOT_BLOCK_LUNCH_ENTRIES` | 1 | Block entries during lunch (0/1) |
+| `TRABOT_BLOCK_CLOSING_NEW` | 1 | Block new entries during closing (0/1) |
+| `TRABOT_OPENING_SCALP_ONLY` | 0 | Opening session scalps only (0/1) |
+
+### P1: Expected Move
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TRABOT_EXPECTED_MOVE_ENABLE` | 1 | Enable expected move calc (0/1) |
+| `TRABOT_MAX_SPREAD_WIDTH_STEPS` | 10 | Max spread width in steps |
+| `TRABOT_MIN_SPREAD_WIDTH_STEPS` | 2 | Min spread width in steps |
+
+### P1: IV Term Structure
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TRABOT_TERM_STRUCTURE_ENABLE` | 1 | Enable term structure analysis (0/1) |
+| `TRABOT_CONTANGO_THRESHOLD` | 0.02 | Contango threshold (2%) |
+| `TRABOT_BACKWARDATION_THRESHOLD` | -0.02 | Backwardation threshold |
+
+### P2: Greeks Monitor
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TRABOT_GREEKS_STOPS_ENABLE` | 1 | Enable Greeks-based stops (0/1) |
+| `TRABOT_MAX_DELTA_LONG` | 0.75 | Max delta for long options |
+| `TRABOT_MIN_DELTA_LONG` | 0.15 | Min delta for long options |
+| `TRABOT_MAX_DELTA_SHORT` | 0.70 | Max delta for short options |
+| `TRABOT_GAMMA_WARNING_DTE` | 2 | DTE for gamma warnings |
+
+### P2: Probability Analysis
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TRABOT_PROBABILITY_FILTER_ENABLE` | 0 | Enable POP filter (0/1) |
+| `TRABOT_MIN_POP_THRESHOLD` | 0.40 | Minimum probability of profit |
+| `TRABOT_MIN_EXPECTED_VALUE` | 0 | Minimum expected value |
+| `TRABOT_PROB_METHOD` | lognormal | POP method (delta/lognormal) |
+
+### P3: Liquidity Model
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TRABOT_LIQUIDITY_MODEL_ENABLE` | 1 | Enable liquidity scoring (0/1) |
+| `TRABOT_MIN_LIQUIDITY_SCORE` | 40 | Minimum liquidity score (0-100) |
+
+### P3: Threshold Optimizer
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TRABOT_OPTIMIZER_ENABLE` | 1 | Enable optimizer (0/1) |
+| `TRABOT_TRAIN_WINDOW_DAYS` | 60 | Training window days |
+| `TRABOT_TEST_WINDOW_DAYS` | 14 | Testing window days |
+| `TRABOT_MIN_TRADES_FOR_VALID` | 20 | Min trades for valid optimization |
+
 ---
 
 ## Data Files
@@ -568,6 +811,8 @@ Checks:
 | `data/portfolio_state.json` | Portfolio position state |
 | `data/clusters.json` | Underlying -> cluster mapping |
 | `data/best_params.json` | Walk-forward tuned parameters |
+| `data/circuit_breaker_state.json` | Circuit breaker daily state |
+| `data/events.json` | Event calendar data |
 
 ### Cache
 

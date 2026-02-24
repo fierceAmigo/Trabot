@@ -63,6 +63,76 @@ from journal import append_history, save_snapshot, make_run_id
 
 from market_sentiment import compute_market_context, append_market_context, MarketContext
 
+# P0-P3 modules (optional imports with graceful fallback)
+try:
+    from event_calendar import should_avoid_entry as event_should_avoid, get_upcoming_events
+    _EVENT_CALENDAR_OK = True
+except ImportError:
+    _EVENT_CALENDAR_OK = False
+    event_should_avoid = None
+    get_upcoming_events = None
+
+try:
+    from circuit_breaker import check_circuit_breaker, get_daily_summary as cb_daily_summary, get_remaining_risk_budget
+    _CIRCUIT_BREAKER_OK = True
+except ImportError:
+    _CIRCUIT_BREAKER_OK = False
+    check_circuit_breaker = None
+    cb_daily_summary = None
+    get_remaining_risk_budget = None
+
+try:
+    from session_manager import should_allow_entry as session_allow_entry, get_session_config, get_size_multiplier as session_size_mult, get_session_factor as session_factor_func
+    _SESSION_MANAGER_OK = True
+except ImportError:
+    _SESSION_MANAGER_OK = False
+    session_allow_entry = None
+    get_session_config = None
+    session_size_mult = None
+    session_factor_func = None
+
+try:
+    from expected_move import calculate_expected_move, suggest_spread_width as em_suggest_width
+    _EXPECTED_MOVE_OK = True
+except ImportError:
+    _EXPECTED_MOVE_OK = False
+    calculate_expected_move = None
+    em_suggest_width = None
+
+try:
+    from iv_term_structure import analyze_term_structure, get_term_structure_bias
+    _IV_TERM_STRUCTURE_OK = True
+except ImportError:
+    _IV_TERM_STRUCTURE_OK = False
+    analyze_term_structure = None
+    get_term_structure_bias = None
+
+try:
+    from probability_analysis import TradeParameters, TradeType, analyze_trade_probability, meets_probability_filters
+    _PROBABILITY_OK = True
+except ImportError:
+    _PROBABILITY_OK = False
+    TradeParameters = None
+    TradeType = None
+    analyze_trade_probability = None
+    meets_probability_filters = None
+
+try:
+    from liquidity_model import calculate_liquidity_score, LiquidityMetrics, filter_by_liquidity, LiquidityGrade
+    _LIQUIDITY_MODEL_OK = True
+except ImportError:
+    _LIQUIDITY_MODEL_OK = False
+    calculate_liquidity_score = None
+    LiquidityMetrics = None
+    filter_by_liquidity = None
+    LiquidityGrade = None
+
+try:
+    from threshold_optimizer import load_best_params as load_tuned_params
+    _THRESHOLD_OPTIMIZER_OK = True
+except ImportError:
+    _THRESHOLD_OPTIMIZER_OK = False
+    load_tuned_params = None
 
 
 # ----------------------------
@@ -109,6 +179,16 @@ TRABOT_PORTFOLIO_CORR_ENABLE = os.getenv("TRABOT_PORTFOLIO_CORR_ENABLE", "0").st
 TRABOT_PORTFOLIO_MAX_CORR = float(os.getenv("TRABOT_PORTFOLIO_MAX_CORR", "0.85"))
 TRABOT_DEDUP_COOLDOWN_MIN = int(os.getenv("TRABOT_DEDUP_COOLDOWN_MIN", "30"))
 TRABOT_WIDTH_MAX_MOVE_PCT = float(os.getenv("TRABOT_WIDTH_MAX_MOVE_PCT", "0.03"))
+
+# P0-P3 feature toggles
+TRABOT_EVENT_CHECK_ENABLE = os.getenv("TRABOT_EVENT_CHECK_ENABLE", "1").strip() == "1"
+TRABOT_CIRCUIT_BREAKER_ENABLE = os.getenv("TRABOT_CIRCUIT_BREAKER_ENABLE", "1").strip() == "1"
+TRABOT_SESSION_RULES_ENABLE = os.getenv("TRABOT_SESSION_RULES_ENABLE", "1").strip() == "1"
+TRABOT_EXPECTED_MOVE_ENABLE = os.getenv("TRABOT_EXPECTED_MOVE_ENABLE", "1").strip() == "1"
+TRABOT_PROBABILITY_FILTER_ENABLE = os.getenv("TRABOT_PROBABILITY_FILTER_ENABLE", "0").strip() == "1"
+TRABOT_MIN_POP = float(os.getenv("TRABOT_MIN_POP", "0.40"))
+TRABOT_LIQUIDITY_MODEL_ENABLE = os.getenv("TRABOT_LIQUIDITY_MODEL_ENABLE", "1").strip() == "1"
+TRABOT_APPLY_BEST_PARAMS = os.getenv("TRABOT_APPLY_BEST_PARAMS", "0").strip() == "1"
 
 
 
@@ -508,11 +588,12 @@ def _pick_best_contract(chain, want_right: str) -> dict | None:
 # Phase-3: multi-leg planning
 # ----------------------------
 
-def _expected_width(entry_u: float, target_u: float, step: int, metrics: dict | None = None) -> int:
+def _expected_width(entry_u: float, target_u: float, step: int, metrics: dict | None = None, iv: float = None, dte: int = None, strategy_type: str = None) -> int:
     """Choose a reasonable structure width in strike points.
 
     Caps target-based width (target_u can be noisy).
     Uses ATR (if present in metrics) as a floor for expected move.
+    P1: Uses expected_move module when IV and DTE are available.
     """
     try:
         entry_u = float(entry_u)
@@ -530,6 +611,22 @@ def _expected_width(entry_u: float, target_u: float, step: int, metrics: dict | 
                 cap_move = max(cap_move, float(atr) * 1.5)
     except Exception:
         pass
+
+    # P1: Use expected_move module for more accurate width
+    if TRABOT_EXPECTED_MOVE_ENABLE and _EXPECTED_MOVE_OK and calculate_expected_move:
+        try:
+            if iv and iv > 0 and dte and dte > 0 and entry_u > 0:
+                em_result = calculate_expected_move(spot=entry_u, iv=iv, dte=dte, confidence=0.68)
+                if em_result and em_result.expected_move > 0:
+                    # Use expected move for cap
+                    cap_move = max(cap_move, em_result.expected_move * 0.8)
+                    # If strategy type provided, use suggest_spread_width
+                    if strategy_type and em_suggest_width:
+                        suggested = em_suggest_width(em_result.expected_move, step, strategy_type)
+                        if suggested > 0:
+                            return int(suggested)
+        except Exception:
+            pass
 
     move = min(move, cap_move)
     steps = int(max(2, round(move / float(step))))
@@ -916,6 +1013,28 @@ def _build_candidate(item: dict, lot_map: dict, market_ctx: MarketContext | None
     sess = _session_tag(candle_ts)
     sess_factor = _session_factor(sess)
 
+    # P0: Event calendar check
+    if TRABOT_EVENT_CHECK_ENABLE and _EVENT_CALENDAR_OK and event_should_avoid:
+        try:
+            avoid, event_reason = event_should_avoid(item["underlying"], dte=MAX_DTE_DAYS or 7)
+            if avoid:
+                return None  # Skip - position would span event
+        except Exception:
+            pass
+
+    # P1: Session manager check
+    if TRABOT_SESSION_RULES_ENABLE and _SESSION_MANAGER_OK and session_allow_entry:
+        try:
+            signal_strength_approx = float(sig.metrics.get("adx", 18)) / 18.0
+            sess_ok, sess_reason = session_allow_entry(
+                signal_strength=signal_strength_approx,
+                strategy_type="SINGLE_LEG",  # Will be refined later
+            )
+            if not sess_ok:
+                return None  # Skip - session rules block entry
+        except Exception:
+            pass
+
     bos_tag, bos_strength = _bos_strength(df, lookback=20)
 
     # Multi-timeframe candles (HTF/DTF) for regime + alignment (Phase-2)
@@ -1287,6 +1406,69 @@ def _build_candidate(item: dict, lot_map: dict, market_ctx: MarketContext | None
     quote_age_s_max = float(max(quote_ages)) if quote_ages else None
     quote_age_s_mean = float(sum(quote_ages)/len(quote_ages)) if quote_ages else None
 
+    # P2: Probability analysis
+    pop = None
+    expected_value = None
+    prob_passes = True
+    if TRABOT_PROBABILITY_FILTER_ENABLE and _PROBABILITY_OK and TradeParameters and analyze_trade_probability:
+        try:
+            # Map plan_action to TradeType
+            trade_type_map = {
+                "BUY_CE": TradeType.LONG_CALL,
+                "BUY_PE": TradeType.LONG_PUT,
+                "BULL_CALL_SPREAD": TradeType.BULL_CALL_SPREAD,
+                "BEAR_PUT_SPREAD": TradeType.BEAR_PUT_SPREAD,
+                "BULL_PUT_CREDIT": TradeType.BULL_PUT_SPREAD,
+                "BEAR_CALL_CREDIT": TradeType.BEAR_CALL_SPREAD,
+            }
+            tt = trade_type_map.get(plan_action)
+            if tt and iv and iv > 0:
+                params = TradeParameters(
+                    spot=float(chain.spot),
+                    strike=float(strike),
+                    strike2=float(legs[1]["strike"]) if len(legs) > 1 else None,
+                    iv=float(iv),
+                    dte=int(dte),
+                    premium=float(entry_opt),
+                    trade_type=tt,
+                )
+                prob_result = analyze_trade_probability(
+                    params,
+                    max_profit=float(max_profit) if max_profit else float(entry_opt) * 2,
+                    max_loss=float(max_loss) if max_loss else float(entry_opt),
+                )
+                pop = prob_result.pop
+                expected_value = prob_result.expected_value
+                # Filter by POP if enabled
+                if pop < TRABOT_MIN_POP:
+                    prob_passes = False
+        except Exception:
+            pass
+
+    if not prob_passes:
+        return None
+
+    # P3: Liquidity scoring
+    liquidity_score = None
+    liquidity_grade = None
+    if TRABOT_LIQUIDITY_MODEL_ENABLE and _LIQUIDITY_MODEL_OK and calculate_liquidity_score and LiquidityMetrics:
+        try:
+            liq_metrics = LiquidityMetrics(
+                bid_ask_spread=float(ask - bid) if (ask and bid) else 0.0,
+                spread_pct=float(spread_pct) if spread_pct else 0.0,
+                bid_size=int(anchor.get("bid_qty", 100)),
+                ask_size=int(anchor.get("ask_qty", 100)),
+                volume=int(anchor.get("volume", 0)),
+                oi=int(anchor.get("oi", 0)),
+                oi_change=0,
+                last_trade_time=str(anchor.get("quote_ts", "")),
+            )
+            liq_result = calculate_liquidity_score(liq_metrics)
+            liquidity_score = liq_result.score
+            liquidity_grade = liq_result.grade.value
+        except Exception:
+            pass
+
     # Dedup signature (cooldown)
     sig_parts = []
     for lg in legs:
@@ -1374,6 +1556,12 @@ def _build_candidate(item: dict, lot_map: dict, market_ctx: MarketContext | None
         "bos_strength": float(bos_strength),
         "htf_align": bool(htf_align),
         "session": sess,
+        # P2: Probability metrics
+        "pop": float(pop) if pop is not None else None,
+        "expected_value": float(expected_value) if expected_value is not None else None,
+        # P3: Liquidity metrics
+        "liquidity_score": float(liquidity_score) if liquidity_score is not None else None,
+        "liquidity_grade": liquidity_grade,
     }
 
 
@@ -1558,6 +1746,36 @@ def main(mode: str = "intraday"):
     HTF_INTERVAL = os.getenv("TRABOT_HTF_INTERVAL", md["htf_interval"]) or md["htf_interval"]
 
     suffix = f"_{mode}"
+
+    # P0: Circuit breaker check (halt scan if daily loss limit exceeded)
+    if TRABOT_CIRCUIT_BREAKER_ENABLE and _CIRCUIT_BREAKER_OK and check_circuit_breaker:
+        try:
+            cb_ok, cb_status, cb_reason = check_circuit_breaker(capital=TRABOT_CAPITAL)
+            if not cb_ok:
+                log.warning(f"Circuit breaker TRIPPED: {cb_reason}")
+                print(f"[CIRCUIT BREAKER] Trading halted: {cb_reason}")
+                return
+            if cb_status.value.startswith("WARNING"):
+                log.info(f"Circuit breaker warning: {cb_reason}")
+                print(f"[CIRCUIT BREAKER] Warning: {cb_reason}")
+        except Exception as e:
+            log.debug(f"Circuit breaker check failed: {e}")
+
+    # P0: Load tuned parameters if enabled
+    if TRABOT_APPLY_BEST_PARAMS and _THRESHOLD_OPTIMIZER_OK and load_tuned_params:
+        try:
+            tuned = load_tuned_params()
+            if tuned:
+                log.info(f"Loaded tuned parameters: {list(tuned.keys())}")
+                # Apply tuned parameters to globals
+                if "ADX_MIN" in tuned:
+                    globals()["ADX_MIN"] = float(tuned["ADX_MIN"])
+                if "STOP_ATR_MULT" in tuned:
+                    STOP_ATR_MULT = float(tuned["STOP_ATR_MULT"])
+                if "TARGET_ATR_MULT" in tuned:
+                    TARGET_ATR_MULT = float(tuned["TARGET_ATR_MULT"])
+        except Exception as e:
+            log.debug(f"Failed to load tuned params: {e}")
 
     universe = build_universe_all_options()
     total = len(universe)
