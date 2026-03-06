@@ -690,6 +690,49 @@ Functions:
 | `TRABOT_WIDTH_MAX_MOVE_PCT` | 0.03 | Max spread width (% of spot) |
 | `TIME_STOP_MIN` | 90 | Time stop (minutes, intraday) |
 
+#### Pro-Grade Stop/Target Logic
+
+The scanner uses a sophisticated, data-driven approach to calculate stop-loss and target levels:
+
+**Expected Move Validation**
+
+Targets are capped using the Expected Move formula to ensure realistic profit expectations:
+
+```
+Expected Move = Spot × IV × √(DTE / 365)
+Max Option Gain = Delta × (Expected Move × 1.5)
+Target Cap = Entry + Max Option Gain
+```
+
+This prevents unrealistic targets (e.g., 1400 target on a 42 entry).
+
+**Dynamic Adjustment Factors**
+
+Base stop/target levels are adjusted based on market conditions:
+
+| Factor | Range | Condition |
+|--------|-------|-----------|
+| IV Percentile | 0.85x - 1.25x | High IV = wider stops, Low IV = tighter |
+| DTE | 0.60x - 1.0x | Shorter DTE = tighter stops |
+| Delta | 0.85x - 1.25x | Higher delta = wider stops |
+
+**Strategy-Specific Logic**
+
+| Strategy | Stop Logic | Target Logic |
+|----------|------------|--------------|
+| Single-leg (BUY_CE/PE) | Entry × 0.60 | Entry × 1.8 (EM-capped) |
+| Debit Spread | Max loss × 0.80 | Max profit × 0.70 |
+| Credit Spread | Max loss × 0.50 | Net credit × 0.70 |
+| Iron Condor | Net credit × 2.0 | Net credit × 0.60 |
+
+**Sanity Checks**
+
+All stop/target values go through validation:
+- Target must be > Entry for long premium positions
+- Stop must be < Entry for long premium positions
+- Minimum risk-reward ratio of 1:1.5 enforced
+- Premium bounds: Stop ≥ 1, Target ≤ Entry × 3
+
 ### Deduplication
 
 | Variable | Default | Description |
