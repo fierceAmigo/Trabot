@@ -299,6 +299,14 @@ INDEX_SPOT_MAP = {
     "MIDCPNIFTY": "NSE:NIFTY MID SELECT",
 }
 
+# ----------------------------
+# Global State (initialized at module level)
+# ----------------------------
+PORTFOLIO_STATE = None          # Portfolio position state (loaded in main)
+CLUSTERS_MAP = {}               # Underlying -> cluster mapping
+SEEN_SIGNATURES = set()         # Dedup: signatures seen this run
+COOLDOWN_LAST_TS = {}           # Dedup: last timestamp per signature
+
 
 # ----------------------------
 # Universe / instruments
@@ -848,47 +856,202 @@ def _compute_plan_risk(action: str, legs: list[dict], step: int) -> tuple[float 
     return float(net), (float(max_loss) if max_loss is not None else None), (float(max_profit) if max_profit is not None else None), be
 
 
-def _plan_stop_target(action: str, entry_opt: float, net_premium: float | None, max_loss: float | None, max_profit: float | None) -> tuple[float, float]:
-    """Return (sl_opt, tgt_opt) in *strategy value space*.
+def _plan_stop_target(
+    action: str,
+    entry_opt: float,
+    net_premium: float | None,
+    max_loss: float | None,
+    max_profit: float | None,
+    iv_pctl: float | None = None,
+    dte: int | None = None,
+    delta: float | None = None,
+    spot: float | None = None,
+    iv: float | None = None,
+) -> tuple[float, float]:
+    """Return (sl_opt, tgt_opt) using data-driven levels with Expected Move validation.
 
-    We treat the 'position value' as the synthetic net premium series:
-      value(t) = sum(+BUY price - SELL price)
-    So:
-      - Debit structures start positive (entry > 0)
-      - Credit structures start negative (entry < 0)
+    PRO-GRADE LOGIC:
+    1. Expected Move Cap: Target can't imply underlying move > 1.5x expected move
+    2. IV Percentile: High IV → wider stops (more volatility expected)
+    3. DTE: Low DTE → tighter stops (theta decay accelerates)
+    4. Delta: OTM options → wider % stops (smaller $ moves per underlying point)
+    5. Minimum R:R: Enforces at least 1:1.5 risk-reward ratio
+    6. Strategy-specific: Different logic for single-leg, debit, credit
 
-    Stop/target are therefore thresholds on that value series.
+    Args:
+        action: Strategy type (BUY_CE, BULL_CALL_SPREAD, etc.)
+        entry_opt: Entry price (option premium)
+        net_premium: Net premium for multi-leg structures
+        max_loss: Maximum loss for defined-risk structures
+        max_profit: Maximum profit for defined-risk structures
+        iv_pctl: IV percentile (0-1), higher = more volatile
+        dte: Days to expiry
+        delta: Option delta (absolute value)
+        spot: Current spot price (for expected move calculation)
+        iv: Implied volatility (annual, for expected move calculation)
     """
     act = (action or "").upper()
     entry_v = float(net_premium) if net_premium is not None else float(entry_opt)
 
-    # Default: 50% stop, 80% target for debit; for credit: 2x credit stop, 50% credit target.
-    if act in ("BUY_CE","BUY_PE","WATCH_CE","WATCH_PE","BULL_CALL_SPREAD","BEAR_PUT_SPREAD","LONG_STRADDLE","LONG_STRANGLE"):
-        # Debit
-        sl = entry_v * 0.50
-        tgt = entry_v * 1.80
-        if max_profit is not None and max_profit > 0 and act in ("BULL_CALL_SPREAD","BEAR_PUT_SPREAD"):
-            tgt = entry_v + 0.80 * float(max_profit)
-        return (max(0.01, sl), max(0.02, tgt))
+    # ===== EXPECTED MOVE CALCULATION =====
+    # Formula: EM = Spot × IV × sqrt(DTE/365)
+    # Used to cap unrealistic targets
+    expected_move = None
+    expected_move_pct = None
+    if spot and spot > 0 and iv and iv > 0 and dte and dte > 0:
+        import math
+        expected_move = spot * iv * math.sqrt(dte / 365.0)
+        expected_move_pct = expected_move / spot
 
-    if act in ("BULL_PUT_CREDIT","BEAR_CALL_CREDIT","IRON_CONDOR"):
-        # Credit (entry_v is negative). Profit target = close at 50% of credit (i.e., value goes from -C toward -0.5C)
+    # ===== DYNAMIC ADJUSTMENT FACTORS =====
+
+    # 1. IV-based: High IV = expect wider swings, use wider stops
+    iv_mult = 1.0
+    if iv_pctl is not None and 0 <= iv_pctl <= 1:
+        iv_mult = 0.85 + (iv_pctl * 0.40)  # Range: 0.85 to 1.25
+
+    # 2. DTE-based: Low DTE = less time for recovery, tighter stops
+    dte_mult = 1.0
+    if dte is not None:
+        if dte <= 1:
+            dte_mult = 0.60
+        elif dte <= 3:
+            dte_mult = 0.75
+        elif dte <= 7:
+            dte_mult = 0.90
+
+    # 3. Delta-based: OTM options need wider % stops
+    delta_mult = 1.0
+    delta_abs = 0.50  # default
+    if delta is not None:
+        delta_abs = min(0.90, max(0.10, abs(delta)))
+        delta_mult = 1.30 - (delta_abs * 0.50)  # Range: 0.85 to 1.25
+
+    # Combined adjustment (clamped)
+    adj = max(0.50, min(1.50, iv_mult * dte_mult * delta_mult))
+
+    # ===== STRATEGY-SPECIFIC STOP/TARGET =====
+
+    # ---------- SINGLE-LEG LONG OPTIONS ----------
+    if act in ("BUY_CE", "BUY_PE", "WATCH_CE", "WATCH_PE"):
+        # Base levels (will be adjusted and validated)
+        # Stop: Exit when premium drops to X% of entry
+        # Target: Exit when premium rises to Y% of entry
+        base_sl_pct = 0.40   # 60% loss
+        base_tgt_pct = 2.00  # 100% gain
+
+        # Apply adjustment
+        sl_pct = base_sl_pct * adj
+        tgt_pct = base_tgt_pct + (1.0 - adj) * 0.30
+
+        # Clamp to reasonable ranges
+        sl_pct = max(0.30, min(0.60, sl_pct))   # Stop: 30% to 60% of entry
+        tgt_pct = max(1.60, min(2.50, tgt_pct)) # Target: 160% to 250% of entry
+
+        sl = entry_v * sl_pct
+        tgt = entry_v * tgt_pct
+
+        # ===== EXPECTED MOVE SANITY CHECK =====
+        # Cap target based on what's achievable given expected move
+        if expected_move and delta_abs > 0:
+            # Max option move ≈ delta × underlying_move
+            # Allow target to imply up to 1.5x expected move (aggressive but realistic)
+            max_underlying_move = expected_move * 1.5
+            max_option_gain = delta_abs * max_underlying_move
+            max_realistic_target = entry_v + max_option_gain
+
+            # Cap target if it implies unrealistic underlying move
+            if tgt > max_realistic_target:
+                tgt = max_realistic_target
+
+        # Ensure minimum target (at least 50% gain)
+        tgt = max(tgt, entry_v * 1.50)
+
+        # Enforce minimum 1:1.5 risk-reward ratio
+        risk = entry_v - sl
+        reward = tgt - entry_v
+        if risk > 0 and reward / risk < 1.5:
+            # Adjust stop tighter to meet R:R (better than inflating target)
+            sl = entry_v - (reward / 1.5)
+            sl = max(sl, entry_v * 0.25)  # But not below 25% floor
+
+        return (max(0.01, sl), max(entry_v * 1.30, tgt))
+
+    # ---------- DEBIT SPREADS ----------
+    if act in ("BULL_CALL_SPREAD", "BEAR_PUT_SPREAD"):
+        # Defined risk/reward structure
+        if max_profit is not None and max_profit > 0:
+            # Target: Capture 70% of max profit (don't wait for full move)
+            tgt = entry_v + (0.70 * float(max_profit))
+            # Stop: 50% of debit paid, adjusted by factors
+            sl = entry_v * (0.50 * adj)
+            sl = max(sl, entry_v * 0.30)  # Floor at 30%
+        else:
+            # Fallback if max_profit unknown
+            sl = entry_v * 0.50 * adj
+            tgt = entry_v * 1.60
+
+        return (max(0.01, sl), max(entry_v * 1.20, tgt))
+
+    # ---------- LONG VOLATILITY (Straddles/Strangles) ----------
+    if act in ("LONG_STRADDLE", "LONG_STRANGLE"):
+        # Need big move to profit (pay both sides)
+        # More aggressive targets, tighter time stops
+        if expected_move and expected_move_pct:
+            # Target: 1x expected move should yield ~30-50% profit
+            # (depends on structure width)
+            tgt = entry_v * (1.30 + expected_move_pct)
+            tgt = max(tgt, entry_v * 1.40)
+            tgt = min(tgt, entry_v * 2.00)
+        else:
+            tgt = entry_v * 1.50
+
+        # Tighter stop for vol structures (theta bleeds both legs)
+        sl = entry_v * 0.60 * adj
+        sl = max(sl, entry_v * 0.40)
+
+        return (max(0.01, sl), max(entry_v * 1.25, tgt))
+
+    # ---------- CREDIT SPREADS ----------
+    if act in ("BULL_PUT_CREDIT", "BEAR_CALL_CREDIT"):
+        # Profit = premium received, Risk = width - premium
         credit = -entry_v
         if credit <= 0:
-            # fallback
-            sl = entry_v * 1.50
-            tgt = entry_v * 0.50
-            return (sl, tgt)
+            return (entry_v * 1.50, entry_v * 0.50)
+
+        # Target: Close at 50% of credit (take profit early, avoid gamma risk)
         tgt = -0.50 * credit
-        # Stop: close at 2x credit (more negative)
-        sl = -2.00 * credit
-        # Bound by max_loss when known
+
+        # Stop: Based on credit received and adjustment
+        # More aggressive in high IV (credit is rich)
+        stop_mult = 1.5 + (adj * 0.5)  # Range: 1.75x to 2.25x credit
+        sl = -stop_mult * credit
+
+        # Cap stop at 80% of max loss if known
         if max_loss is not None and max_loss > 0:
-            sl = max(sl, -float(max_loss))
+            sl = max(sl, -float(max_loss) * 0.80)
+
         return (sl, tgt)
 
-    # Unknown: keep old behavior
-    return (entry_v * 0.50, entry_v * 1.80)
+    # ---------- IRON CONDOR ----------
+    if act == "IRON_CONDOR":
+        credit = -entry_v
+        if credit <= 0:
+            return (entry_v * 1.50, entry_v * 0.50)
+
+        # Target: Close at 50% of credit
+        tgt = -0.50 * credit
+
+        # Stop: Tighter for IC (both sides can blow up)
+        sl = -1.50 * credit
+
+        if max_loss is not None and max_loss > 0:
+            sl = max(sl, -float(max_loss) * 0.70)  # Tighter: 70% of max loss
+
+        return (sl, tgt)
+
+    # ---------- UNKNOWN: Conservative fallback ----------
+    return (entry_v * 0.40, entry_v * 1.60)
 
 
 def _anchor_leg_index(blueprint: Blueprint, legs: list[dict]) -> int:
@@ -1244,48 +1407,56 @@ def _build_candidate(item: dict, lot_map: dict, market_ctx: MarketContext | None
     # Risk / breakevens
     net_premium, max_loss, max_profit, breakevens = _compute_plan_risk(plan_action, legs, step)
 
-    # Strategy-aware stop/target in synthetic value space
-    # Stop/Target logic:
-    # - For multi-leg: use strategy value space (net premium) levels
-    # - For single-leg: map underlying stop/target to option using delta, with sanity caps
+    # Strategy-aware stop/target using dynamic, data-driven levels
+    # Factors: IV percentile, DTE, Delta, Expected Move - all affect optimal stop/target
+    anchor_delta = abs(float(anchor.get("delta", 0.5))) if anchor.get("delta") else None
+    spot_price = float(chain.spot) if chain and chain.spot else None
+
     if len(legs) > 1 or plan_action in ("BULL_CALL_SPREAD","BEAR_PUT_SPREAD","BULL_PUT_CREDIT","BEAR_CALL_CREDIT","IRON_CONDOR","LONG_STRADDLE","LONG_STRANGLE"):
-        sl_opt, tgt_opt = _plan_stop_target(plan_action, float(entry_opt), net_premium, max_loss, max_profit)
+        # Multi-leg: use net premium and structure-specific logic
+        sl_opt, tgt_opt = _plan_stop_target(
+            plan_action, float(entry_opt), net_premium, max_loss, max_profit,
+            iv_pctl=pct, dte=dte, delta=anchor_delta, spot=spot_price, iv=iv
+        )
     else:
-        # Default for intraday: premium-based levels (avoids absurd targets from underlying mapping).
-        if TRABOT_SINGLE_LEG_SL_TGT_MODE == "premium":
-            sl_opt, tgt_opt = _plan_stop_target(plan_action, float(entry_opt), float(entry_opt), None, None)
-        else:
-                delta_abs = abs(float(anchor.get("delta", 0.5)))
-                delta_abs = min(0.75, max(0.20, delta_abs))
-                try:
-                    risk_u = abs(float(entry_u) - float(stop_u))
-                except Exception:
-                    risk_u = 0.0
-                try:
-                    rew_u = abs(float(target_u) - float(entry_u))
-                except Exception:
-                    rew_u = 0.0
+        # Single-leg: use premium-based levels with dynamic adjustments + Expected Move cap
+        sl_opt, tgt_opt = _plan_stop_target(
+            plan_action, float(entry_opt), float(entry_opt), None, None,
+            iv_pctl=pct, dte=dte, delta=anchor_delta, spot=spot_price, iv=iv
+        )
 
-                spot_u = float(chain.spot)
-                max_t_move = max(1e-9, spot_u * float(TRABOT_MAX_TARGET_MOVE_PCT))
-                max_s_move = max(1e-9, spot_u * float(TRABOT_MAX_STOP_MOVE_PCT))
+    # Universal sanity caps for stop/target (applies to ALL modes)
+    # For LONG premium (BUY_CE, BUY_PE): target > entry > stop
+    # For SHORT premium (credit spreads): opposite
+    is_long_premium = plan_action in ("BUY_CE", "BUY_PE", "WATCH_CE", "WATCH_PE",
+                                       "BULL_CALL_SPREAD", "BEAR_PUT_SPREAD",
+                                       "LONG_STRADDLE", "LONG_STRANGLE")
 
-                # target
-                if rew_u <= 0 or rew_u > max_t_move:
-                    # fallback: premium-based target
-                    _, tgt_opt = _plan_stop_target(plan_action, float(entry_opt), float(entry_opt), None, None)
-                else:
-                    tgt_opt = float(entry_opt) + delta_abs * float(rew_u)
+    if is_long_premium:
+        # Long premium: you profit when premium goes UP
+        # Target should be ABOVE entry, Stop should be BELOW entry
+        # Use max of cap multiplier and 1.5 to avoid config conflicts
+        min_target_mult = 1.50
+        max_target_mult = max(float(TRABOT_TGT_CAP_MULT), min_target_mult)
 
-                # stop
-                if risk_u <= 0 or risk_u > max_s_move:
-                    sl_opt = max(0.05, float(entry_opt) * 0.50)
-                else:
-                    sl_opt = max(0.05, float(entry_opt) - delta_abs * float(risk_u))
+        # Clamp target: at least 1.5x, at most TGT_CAP_MULT (default 3x)
+        tgt_opt = max(float(tgt_opt), float(entry_opt) * min_target_mult)
+        tgt_opt = min(float(tgt_opt), float(entry_opt) * max_target_mult)
 
-                # cap extreme option targets (prevents insane prints)
-                tgt_opt = min(float(tgt_opt), float(entry_opt) * float(TRABOT_TGT_CAP_MULT))
+        # Clamp stop: between 20% and 70% of entry
+        sl_opt = max(float(sl_opt), float(entry_opt) * 0.20)
+        sl_opt = min(float(sl_opt), float(entry_opt) * 0.70)
 
+        # Final safety: ensure target > entry > stop (should always be true now)
+        if tgt_opt <= entry_opt:
+            tgt_opt = float(entry_opt) * 1.80
+        if sl_opt >= entry_opt:
+            sl_opt = float(entry_opt) * 0.50
+    else:
+        # Credit spreads: you profit when premium goes DOWN (decays)
+        # These have different dynamics - keep original logic
+        tgt_opt = min(float(tgt_opt), float(entry_opt) * float(TRABOT_TGT_CAP_MULT))
+        sl_opt = max(float(sl_opt), float(entry_opt) * 0.10)
 
     # price used for caps (conservative): max_loss per contract when available
     option_price_for_caps = float(max_loss) if (max_loss is not None and max_loss > 0) else float(entry_opt)
